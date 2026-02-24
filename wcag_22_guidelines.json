@@ -1680,9 +1680,9 @@
                     },
                     { 
                         "ref_id": "2.5.5",
-                        "title": "Target Size",
+                        "title": "Target Size Minimum",
                         "description": "The size of the target for pointer inputs is at least 44 by 44 CSS pixels except when:",
-                        "url": "https://www.w3.org/TR/WCAG22/#target-size",
+                        "url": "https://www.w3.org/TR/WCAG22/#target-size-minimum",
                         "level": "AAA",
                         "special_cases": [
                             {
@@ -1717,11 +1717,11 @@
                         "references": [
                             {
                                 "title": "How to Meet 2.5.5",
-                                "url": "https://www.w3.org/WAI/WCAG22/quickref/#target-size"
+                                "url": "https://www.w3.org/WAI/WCAG22/quickref/#target-size-minimum"
                             },
                             {
                                 "title": "Understanding 2.5.5",
-                                "url": "https://www.w3.org/WAI/WCAG22/Understanding/target-size.html"
+                                "url": "https://www.w3.org/WAI/WCAG22/Understanding/target-size-minimum.html"
                             }
                         ]
                     },

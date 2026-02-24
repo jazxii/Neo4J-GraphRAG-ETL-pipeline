@@ -3,7 +3,7 @@ Pipeline Step 1: WCAG 2.2 Foundation — ETL into Neo4j Knowledge Graph.
 
 A proper ETL pipeline with clearly separated phases:
 
-  EXTRACT  → Read and validate WCAG 2.2 JSON source data
+  EXTRACT  → Read and validate WCAG 2.2 JSON source data (base or enriched)
   TRANSFORM→ Normalize, enrich, and shape records for graph ingestion
   LOAD     → Batch-write nodes and relationships into Neo4j
   VALIDATE → Verify graph integrity post-load
@@ -12,11 +12,18 @@ This runs FIRST — before any JIRA data.
 Creates the authoritative WCAG knowledge layer that all bugs
 will link to via :VIOLATES relationships.
 
+Supports BOTH the base JSON (wcag_22_guidelines.json) and the enriched
+JSON (wcag_22_guidelines_enriched.json) produced by 00_enrich_wcag_json.py.
+When enriched data is present, additional nodes and relationships are created.
+
 Graph Schema:
   Nodes : WCAGPrinciple · WCAGGuideline · WCAGCriterion
           ConformanceLevel · WCAGSpecialCase · WCAGNote · WCAGReference
+          WCAGTechnique · WCAGTestRule · WCAGExample · WCAGBenefit
   Edges : PART_OF · HAS_LEVEL · HAS_SPECIAL_CASE · HAS_NOTE
           HAS_REFERENCE · RELATED_CRITERION · RELATED_GUIDELINE
+          HAS_TECHNIQUE · HAS_FAILURE · HAS_ADVISORY_TECHNIQUE
+          HAS_TEST_RULE · HAS_EXAMPLE · HAS_BENEFIT · IMPACTS_DISABILITY
 
 Usage:
   python 01_pipeline_wcag_foundation.py
@@ -86,6 +93,11 @@ class PipelineMetrics:
     notes: int = 0
     references: int = 0
     cross_refs: int = 0
+    techniques: int = 0
+    test_rules: int = 0
+    examples: int = 0
+    benefits: int = 0
+    enriched: bool = False        # True when enriched JSON is detected
     phase_times: dict = field(default_factory=dict)
 
     def summary(self) -> dict:
@@ -146,7 +158,8 @@ def phase_preflight(db: Neo4jConnection):
     log.info("PHASE 0 ▸ Pre-flight checks")
 
     # ── Clean auxiliary nodes (safe to recreate) ──
-    for label in ["WCAGSpecialCase", "WCAGNote", "WCAGReference"]:
+    for label in ["WCAGSpecialCase", "WCAGNote", "WCAGReference",
+                   "WCAGTechnique", "WCAGTestRule", "WCAGExample", "WCAGBenefit"]:
         db.write(f"MATCH (n:{label}) DETACH DELETE n")
     log.info("  Cleaned auxiliary WCAG nodes")
 
@@ -156,11 +169,17 @@ def phase_preflight(db: Neo4jConnection):
         "CREATE CONSTRAINT IF NOT EXISTS FOR (g:WCAGGuideline)    REQUIRE g.ref_id IS UNIQUE",
         "CREATE CONSTRAINT IF NOT EXISTS FOR (c:WCAGCriterion)    REQUIRE c.ref_id IS UNIQUE",
         "CREATE CONSTRAINT IF NOT EXISTS FOR (cl:ConformanceLevel) REQUIRE cl.name  IS UNIQUE",
+        "CREATE CONSTRAINT IF NOT EXISTS FOR (t:WCAGTechnique)    REQUIRE t.tech_id IS UNIQUE",
         "CREATE INDEX IF NOT EXISTS FOR (c:WCAGCriterion) ON (c.code)",
         "CREATE INDEX IF NOT EXISTS FOR (c:WCAGCriterion) ON (c.title)",
         "CREATE INDEX IF NOT EXISTS FOR (c:WCAGCriterion) ON (c.level)",
+        "CREATE INDEX IF NOT EXISTS FOR (c:WCAGCriterion) ON (c.wcag_version)",
+        "CREATE INDEX IF NOT EXISTS FOR (c:WCAGCriterion) ON (c.automatable)",
         "CREATE INDEX IF NOT EXISTS FOR (g:WCAGGuideline) ON (g.title)",
         "CREATE INDEX IF NOT EXISTS FOR (p:WCAGPrinciple) ON (p.name)",
+        "CREATE INDEX IF NOT EXISTS FOR (t:WCAGTechnique) ON (t.technology)",
+        "CREATE INDEX IF NOT EXISTS FOR (t:WCAGTechnique) ON (t.category)",
+        "CREATE INDEX IF NOT EXISTS FOR (tr:WCAGTestRule) ON (tr.title)",
     ]
     for stmt in schema_statements:
         try:
@@ -241,11 +260,37 @@ class TransformedData:
     guideline_refs: list[dict]    # guideline → reference edges
     criterion_refs: list[dict]    # criterion → reference edges
     cross_refs: list[dict]        # criterion ↔ criterion/guideline edges
+    # ── Enriched data (empty if using base JSON) ──
+    techniques: list[dict]        # WCAGTechnique nodes
+    technique_edges: list[dict]   # criterion → technique edges
+    test_rules: list[dict]        # WCAGTestRule nodes + edges
+    examples: list[dict]          # WCAGExample nodes + edges
+    benefits: list[dict]          # WCAGBenefit nodes + edges
+    enriched_cross_refs: list[dict]  # dynamically discovered SC ↔ SC refs
 
 
 def phase_transform(raw_data: list[dict], metrics: PipelineMetrics) -> TransformedData:
     """Normalize raw JSON into flat, batch-ready record lists."""
     log.info("PHASE 2 ▸ Transform — normalizing records")
+
+    # ── Detect enriched data ──
+    # Check the first success criterion for enriched fields
+    first_sc = None
+    for p in raw_data:
+        for g in p.get("guidelines", []):
+            for sc in g.get("success_criteria", []):
+                first_sc = sc
+                break
+            if first_sc:
+                break
+        if first_sc:
+            break
+    is_enriched = first_sc is not None and "techniques" in first_sc
+    metrics.enriched = is_enriched
+    if is_enriched:
+        log.info("  Detected ENRICHED JSON — extracting techniques, examples, test rules, benefits")
+    else:
+        log.info("  Detected BASE JSON — enriched fields will be empty")
 
     # ── Static conformance levels ──
     conformance_levels = [
@@ -262,6 +307,14 @@ def phase_transform(raw_data: list[dict], metrics: PipelineMetrics) -> Transform
     references = {}          # url → {title, url}  (deduplicated)
     guideline_refs = []
     criterion_refs = []
+
+    # ── Enriched collections ──
+    techniques_map = {}      # tech_id → technique node dict (deduplicated globally)
+    technique_edges = []     # {criterion_id, tech_id, relationship}
+    test_rules_list = []     # {criterion_id, title, url}
+    examples_list = []       # {criterion_id, index, title, description}
+    benefits_list = []       # {criterion_id, index, description}
+    enriched_cross_refs = [] # {source, target, rel, desc}
 
     for principle in raw_data:
         principles.append({
@@ -293,7 +346,8 @@ def phase_transform(raw_data: list[dict], metrics: PipelineMetrics) -> Transform
                 metrics.references += 1
 
             for sc in guideline.get("success_criteria", []):
-                criteria.append({
+                # ── Base criterion record (always present) ──
+                criterion_record = {
                     "ref_id": sc["ref_id"],
                     "title": sc["title"],
                     "description": sc["description"],
@@ -304,7 +358,24 @@ def phase_transform(raw_data: list[dict], metrics: PipelineMetrics) -> Transform
                     "principle_title": principle["title"],
                     "guideline_title": guideline["title"],
                     "full_label": f"{sc['ref_id']} {sc['title']} (Level {sc['level']})",
-                })
+                }
+
+                # ── Enriched criterion properties (if present) ──
+                if is_enriched:
+                    in_brief = sc.get("in_brief", {})
+                    criterion_record.update({
+                        "intent": (sc.get("intent") or "")[:2000],
+                        "wcag_version": sc.get("wcag_version", "2.0"),
+                        "automatable": sc.get("automatable", "manual"),
+                        "disability_impact": sc.get("disability_impact", []),
+                        "input_types_affected": sc.get("input_types_affected", []),
+                        "technology_applicability": sc.get("technology_applicability", []),
+                        "in_brief_goal": in_brief.get("goal", ""),
+                        "in_brief_what_to_do": in_brief.get("what_to_do", ""),
+                        "in_brief_why_important": in_brief.get("why_important", ""),
+                    })
+
+                criteria.append(criterion_record)
                 metrics.criteria += 1
 
                 # Special cases
@@ -337,7 +408,74 @@ def phase_transform(raw_data: list[dict], metrics: PipelineMetrics) -> Transform
                     })
                     metrics.references += 1
 
-    # ── Static cross-references ──
+                # ── Enriched: Techniques ──
+                if is_enriched:
+                    tech_data = sc.get("techniques", {})
+                    for category, rel_type in [
+                        ("sufficient", "HAS_TECHNIQUE"),
+                        ("advisory", "HAS_ADVISORY_TECHNIQUE"),
+                        ("failures", "HAS_FAILURE"),
+                    ]:
+                        for tech in tech_data.get(category, []):
+                            tech_id = tech.get("id", "")
+                            if not tech_id:
+                                continue
+                            # Build global technique node (deduplicated)
+                            if tech_id not in techniques_map:
+                                techniques_map[tech_id] = {
+                                    "tech_id": tech_id,
+                                    "title": tech.get("title", ""),
+                                    "url": tech.get("url", ""),
+                                    "technology": tech.get("technology", "general"),
+                                    "category": category,
+                                }
+                                metrics.techniques += 1
+                            # Edge: criterion → technique
+                            technique_edges.append({
+                                "criterion_id": sc["ref_id"],
+                                "tech_id": tech_id,
+                                "relationship": rel_type,
+                            })
+
+                    # ── Enriched: Test Rules ──
+                    for rule in sc.get("test_rules", []):
+                        test_rules_list.append({
+                            "criterion_id": sc["ref_id"],
+                            "title": rule.get("title", ""),
+                            "url": rule.get("url", ""),
+                        })
+                        metrics.test_rules += 1
+
+                    # ── Enriched: Examples ──
+                    for idx, ex in enumerate(sc.get("examples", [])):
+                        examples_list.append({
+                            "criterion_id": sc["ref_id"],
+                            "index": idx,
+                            "title": ex.get("title", ""),
+                            "description": ex.get("description", ""),
+                        })
+                        metrics.examples += 1
+
+                    # ── Enriched: Benefits ──
+                    for idx, benefit in enumerate(sc.get("benefits", [])):
+                        benefit_text = benefit if isinstance(benefit, str) else str(benefit)
+                        benefits_list.append({
+                            "criterion_id": sc["ref_id"],
+                            "index": idx,
+                            "description": benefit_text,
+                        })
+                        metrics.benefits += 1
+
+                    # ── Enriched: Dynamic cross-references (from Understanding pages) ──
+                    for related_id in sc.get("related_scs", []):
+                        enriched_cross_refs.append({
+                            "source": sc["ref_id"],
+                            "target": related_id,
+                            "rel": "RELATED_CRITERION",
+                            "desc": f"Related criterion identified from Understanding {sc['ref_id']}",
+                        })
+
+    # ── Static cross-references (always present) ──
     cross_refs = [
         {"source": "1.3.3", "target": "1.4",   "rel": "RELATED_GUIDELINE", "desc": "For color requirements, refer to Guideline 1.4"},
         {"source": "1.4.1", "target": "1.3",   "rel": "RELATED_GUIDELINE", "desc": "Other perception forms covered in Guideline 1.3"},
@@ -356,6 +494,13 @@ def phase_transform(raw_data: list[dict], metrics: PipelineMetrics) -> Transform
         metrics.principles, metrics.guidelines, metrics.criteria,
         metrics.special_cases, metrics.notes, metrics.references,
     )
+    if is_enriched:
+        log.info(
+            "  Enriched    → %d techniques, %d test rules, %d examples, "
+            "%d benefits, %d dynamic cross-refs",
+            metrics.techniques, metrics.test_rules, metrics.examples,
+            metrics.benefits, len(enriched_cross_refs),
+        )
 
     return TransformedData(
         conformance_levels=conformance_levels,
@@ -368,6 +513,12 @@ def phase_transform(raw_data: list[dict], metrics: PipelineMetrics) -> Transform
         guideline_refs=guideline_refs,
         criterion_refs=criterion_refs,
         cross_refs=cross_refs,
+        techniques=list(techniques_map.values()),
+        technique_edges=technique_edges,
+        test_rules=test_rules_list,
+        examples=examples_list,
+        benefits=benefits_list,
+        enriched_cross_refs=enriched_cross_refs,
     )
 
 
@@ -412,6 +563,7 @@ def phase_load(db: Neo4jConnection, data: TransformedData):
     log.info("  Loaded %d guidelines", len(data.guidelines))
 
     # ── 3d. Criteria + PART_OF → Guideline + HAS_LEVEL → ConformanceLevel ──
+    # Enriched properties are set conditionally (null-safe via COALESCE)
     db.batch_write("""
         UNWIND $rows AS row
         MERGE (c:WCAGCriterion {ref_id: row.ref_id})
@@ -425,7 +577,16 @@ def phase_load(db: Neo4jConnection, data: TransformedData):
             c.principle_id     = row.principle_id,
             c.principle_title  = row.principle_title,
             c.guideline_title  = row.guideline_title,
-            c.full_label       = row.full_label
+            c.full_label       = row.full_label,
+            c.intent           = COALESCE(row.intent, ''),
+            c.wcag_version     = COALESCE(row.wcag_version, '2.0'),
+            c.automatable      = COALESCE(row.automatable, 'manual'),
+            c.disability_impact       = COALESCE(row.disability_impact, []),
+            c.input_types_affected    = COALESCE(row.input_types_affected, []),
+            c.technology_applicability = COALESCE(row.technology_applicability, []),
+            c.in_brief_goal           = COALESCE(row.in_brief_goal, ''),
+            c.in_brief_what_to_do     = COALESCE(row.in_brief_what_to_do, ''),
+            c.in_brief_why_important  = COALESCE(row.in_brief_why_important, '')
         WITH c, row
         MATCH (g:WCAGGuideline {ref_id: row.guideline_id})
         MERGE (c)-[:PART_OF]->(g)
@@ -494,13 +655,11 @@ def phase_load(db: Neo4jConnection, data: TransformedData):
         """, data.criterion_refs)
     log.info("  Linked %d criterion references", len(data.criterion_refs))
 
-    # ── 3j. Cross-reference relationships ──
-    # These use two different rel types, so we handle them per-type
+    # ── 3j. Cross-reference relationships (static) ──
     for rel_type in ("RELATED_CRITERION", "RELATED_GUIDELINE"):
         batch = [r for r in data.cross_refs if r["rel"] == rel_type]
         if not batch:
             continue
-        # Parameterized relationship type requires separate queries
         for row in batch:
             try:
                 db.write(f"""
@@ -512,7 +671,94 @@ def phase_load(db: Neo4jConnection, data: TransformedData):
                 """, {"source": row["source"], "target": row["target"], "desc": row["desc"]})
             except Exception as e:
                 log.warning("  Cross-ref %s → %s failed: %s", row["source"], row["target"], e)
-    log.info("  Created %d cross-reference relationships", len(data.cross_refs))
+    log.info("  Created %d static cross-reference relationships", len(data.cross_refs))
+
+    # ================================================================
+    #  ENRICHED DATA LOADING (only when enriched JSON is used)
+    # ================================================================
+
+    # ── 3k. Technique nodes (globally deduplicated by tech_id) ──
+    if data.techniques:
+        db.batch_write("""
+            UNWIND $rows AS row
+            MERGE (t:WCAGTechnique {tech_id: row.tech_id})
+            SET t.title      = row.title,
+                t.url        = row.url,
+                t.technology = row.technology,
+                t.category   = row.category
+        """, data.techniques)
+        log.info("  Loaded %d technique nodes", len(data.techniques))
+
+    # ── 3l. Criterion → Technique edges (3 relationship types) ──
+    if data.technique_edges:
+        for rel_type in ("HAS_TECHNIQUE", "HAS_ADVISORY_TECHNIQUE", "HAS_FAILURE"):
+            batch = [e for e in data.technique_edges if e["relationship"] == rel_type]
+            if not batch:
+                continue
+            db.batch_write(f"""
+                UNWIND $rows AS row
+                MATCH (c:WCAGCriterion {{ref_id: row.criterion_id}})
+                MATCH (t:WCAGTechnique {{tech_id: row.tech_id}})
+                MERGE (c)-[:{rel_type}]->(t)
+            """, batch)
+            log.info("  Linked %d %s edges", len(batch), rel_type)
+
+    # ── 3m. Test Rule nodes + edges ──
+    if data.test_rules:
+        db.batch_write("""
+            UNWIND $rows AS row
+            MATCH (c:WCAGCriterion {ref_id: row.criterion_id})
+            CREATE (tr:WCAGTestRule {
+                criterion_id: row.criterion_id,
+                title:        row.title,
+                url:          row.url
+            })
+            CREATE (c)-[:HAS_TEST_RULE]->(tr)
+        """, data.test_rules)
+        log.info("  Loaded %d test rules", len(data.test_rules))
+
+    # ── 3n. Example nodes + edges ──
+    if data.examples:
+        db.batch_write("""
+            UNWIND $rows AS row
+            MATCH (c:WCAGCriterion {ref_id: row.criterion_id})
+            CREATE (ex:WCAGExample {
+                criterion_id: row.criterion_id,
+                index:        row.index,
+                title:        row.title,
+                description:  row.description
+            })
+            CREATE (c)-[:HAS_EXAMPLE]->(ex)
+        """, data.examples)
+        log.info("  Loaded %d examples", len(data.examples))
+
+    # ── 3o. Benefit nodes + edges ──
+    if data.benefits:
+        db.batch_write("""
+            UNWIND $rows AS row
+            MATCH (c:WCAGCriterion {ref_id: row.criterion_id})
+            CREATE (b:WCAGBenefit {
+                criterion_id: row.criterion_id,
+                index:        row.index,
+                description:  row.description
+            })
+            CREATE (c)-[:HAS_BENEFIT]->(b)
+        """, data.benefits)
+        log.info("  Loaded %d benefits", len(data.benefits))
+
+    # ── 3p. Dynamic cross-references (from enriched Understanding pages) ──
+    if data.enriched_cross_refs:
+        for row in data.enriched_cross_refs:
+            try:
+                db.write("""
+                    MATCH (a:WCAGCriterion {ref_id: $source})
+                    MATCH (b:WCAGCriterion {ref_id: $target})
+                    MERGE (a)-[r:RELATED_CRITERION]->(b)
+                    SET r.description = $desc, r.source = 'understanding_page'
+                """, {"source": row["source"], "target": row["target"], "desc": row["desc"]})
+            except Exception as e:
+                log.warning("  Dynamic cross-ref %s → %s failed: %s", row["source"], row["target"], e)
+        log.info("  Created %d dynamic cross-reference relationships", len(data.enriched_cross_refs))
 
 
 # ================================================================
@@ -528,7 +774,8 @@ def phase_validate(db: Neo4jConnection, metrics: PipelineMetrics) -> bool:
         MATCH (n)
         WHERE n:WCAGPrinciple OR n:WCAGGuideline OR n:WCAGCriterion
            OR n:WCAGSpecialCase OR n:WCAGNote OR n:WCAGReference
-           OR n:ConformanceLevel
+           OR n:ConformanceLevel OR n:WCAGTechnique OR n:WCAGTestRule
+           OR n:WCAGExample OR n:WCAGBenefit
         RETURN labels(n)[0] AS label, count(n) AS count
         ORDER BY count DESC
     """)
@@ -579,6 +826,64 @@ def phase_validate(db: Neo4jConnection, metrics: PipelineMetrics) -> bool:
         log.info("  PASS — Conformance level distribution:")
         for row in level_stats:
             log.info("    Level %-5s %d criteria", row["level"], row["count"])
+
+    # ── 4e. Enriched data validation (only when enriched JSON was used) ──
+    if metrics.enriched:
+        log.info("  Enriched data validation:")
+
+        # Technique nodes loaded
+        tech_count = db.read("MATCH (t:WCAGTechnique) RETURN count(t) AS count")[0]["count"]
+        if tech_count == 0:
+            passed = False
+            log.error("  FAIL — No WCAGTechnique nodes found (expected %d)", metrics.techniques)
+        else:
+            log.info("    PASS — %d WCAGTechnique nodes loaded", tech_count)
+
+        # Every technique should be linked to at least one criterion
+        orphan_techniques = db.read("""
+            MATCH (t:WCAGTechnique)
+            WHERE NOT ()-[:HAS_TECHNIQUE|HAS_ADVISORY_TECHNIQUE|HAS_FAILURE]->(t)
+            RETURN count(t) AS count
+        """)[0]["count"]
+        if orphan_techniques > 0:
+            log.warning("  WARN — %d orphan WCAGTechnique nodes (no criterion link)", orphan_techniques)
+
+        # Criteria with enriched properties
+        enriched_criteria = db.read("""
+            MATCH (c:WCAGCriterion)
+            WHERE c.intent IS NOT NULL AND c.intent <> ''
+            RETURN count(c) AS count
+        """)[0]["count"]
+        log.info("    %d/%d criteria have intent text", enriched_criteria, metrics.criteria)
+
+        # Criteria with wcag_version set
+        versioned = db.read("""
+            MATCH (c:WCAGCriterion)
+            WHERE c.wcag_version IS NOT NULL
+            WITH c.wcag_version AS version, count(c) AS count
+            RETURN version, count ORDER BY version
+        """)
+        if versioned:
+            log.info("    WCAG version distribution:")
+            for row in versioned:
+                log.info("      WCAG %-5s %d criteria", row["version"], row["count"])
+
+        # Automation classification
+        automatable_stats = db.read("""
+            MATCH (c:WCAGCriterion)
+            WHERE c.automatable IS NOT NULL
+            WITH c.automatable AS level, count(c) AS count
+            RETURN level, count ORDER BY level
+        """)
+        if automatable_stats:
+            log.info("    Automation classification:")
+            for row in automatable_stats:
+                log.info("      %-10s %d criteria", row["level"], row["count"])
+
+        # Test rules, examples, benefits counts
+        for label in ["WCAGTestRule", "WCAGExample", "WCAGBenefit"]:
+            count = db.read(f"MATCH (n:{label}) RETURN count(n) AS count")[0]["count"]
+            log.info("    %d %s nodes", count, label)
 
     return passed
 

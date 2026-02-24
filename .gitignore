@@ -144,6 +144,9 @@ ENV/
 env.bak/
 venv.bak/
 
+# Generated enriched WCAG JSON (large, re-generable via 00_enrich_wcag_json.py)
+wcag_22_guidelines_enriched.json
+
 # Spyder project settings
 .spyderproject
 .spyproject
