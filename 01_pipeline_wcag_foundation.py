@@ -1,361 +1,679 @@
 """
-Pipeline Step 1: Load WCAG 2.2 Specification into Neo4j.
+Pipeline Step 1: WCAG 2.2 Foundation — ETL into Neo4j Knowledge Graph.
+
+A proper ETL pipeline with clearly separated phases:
+
+  EXTRACT  → Read and validate WCAG 2.2 JSON source data
+  TRANSFORM→ Normalize, enrich, and shape records for graph ingestion
+  LOAD     → Batch-write nodes and relationships into Neo4j
+  VALIDATE → Verify graph integrity post-load
 
 This runs FIRST — before any JIRA data.
 Creates the authoritative WCAG knowledge layer that all bugs
 will link to via :VIOLATES relationships.
 
-Node Types:
-  - WCAGPrinciple (4): Perceivable, Operable, Understandable, Robust
-  - WCAGGuideline (13): 1.1 through 4.1
-  - WCAGCriterion (86+): 1.1.1 through 4.1.3
-  - ConformanceLevel (3): A, AA, AAA
-  - WCAGSpecialCase: Exceptions/conditions per criterion
-  - WCAGNote: Clarifying notes per criterion
-  - WCAGReference: How to Meet / Understanding links
+Graph Schema:
+  Nodes : WCAGPrinciple · WCAGGuideline · WCAGCriterion
+          ConformanceLevel · WCAGSpecialCase · WCAGNote · WCAGReference
+  Edges : PART_OF · HAS_LEVEL · HAS_SPECIAL_CASE · HAS_NOTE
+          HAS_REFERENCE · RELATED_CRITERION · RELATED_GUIDELINE
 
 Usage:
-  python pipeline_step1_wcag_foundation.py
+  python 01_pipeline_wcag_foundation.py
 """
 
 from neo4j import GraphDatabase
 import json
 import sys
 import os
+import time
+import logging
+from dataclasses import dataclass, field
 from dotenv import load_dotenv
 
 # Load environment variables from .env file
 load_dotenv()
 
 # ============================================================
-# CONFIGURATION
+# LOGGING CONFIGURATION
 # ============================================================
-NEO4J_URI = os.getenv("NEO4J_URI")
-NEO4J_USER = os.getenv("NEO4J_USER")
-NEO4J_PASSWORD = os.getenv("NEO4J_PASSWORD")
-
-WCAG_JSON_FILE = os.getenv("WCAG_JSON_FILE", "wcag_22_guidelines.json")
-
-driver = GraphDatabase.driver(NEO4J_URI, auth=(NEO4J_USER, NEO4J_PASSWORD))
-
-
-def run_query(query, params=None):
-    with driver.session() as session:
-        return [r.data() for r in session.run(query, params or {})]
-
-
-def run_write(query, params=None):
-    """Execute a write query without consuming results."""
-    with driver.session() as session:
-        session.run(query, params or {})
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s │ %(levelname)-7s │ %(message)s",
+    datefmt="%H:%M:%S",
+)
+log = logging.getLogger("wcag_etl")
 
 
 # ============================================================
-# STEP 1: CLEAN SLATE FOR WCAG NODES (optional, safe)
+# PIPELINE CONFIGURATION
 # ============================================================
-print("🧹 Cleaning existing WCAG nodes (if any)...")
+@dataclass
+class PipelineConfig:
+    """Central, immutable configuration for the pipeline run."""
+    neo4j_uri: str = os.getenv("NEO4J_URI", "")
+    neo4j_user: str = os.getenv("NEO4J_USER", "")
+    neo4j_password: str = os.getenv("NEO4J_PASSWORD", "")
+    wcag_json_file: str = os.getenv("WCAG_JSON_FILE", "wcag_22_guidelines.json")
+    batch_size: int = 100  # Cypher UNWIND batch size
 
-# Remove old WCAG data to avoid duplicates on re-run
-for label in ['WCAGSpecialCase', 'WCAGNote', 'WCAGReference']:
-    run_write(f"MATCH (n:{label}) DETACH DELETE n")
-
-# Don't delete WCAGCriterion/Guideline/Principle yet — bugs may link to them
-# Instead we'll MERGE (upsert) below
-
-print("   ✅ Cleaned auxiliary WCAG nodes")
-
-
-# ============================================================
-# STEP 2: CREATE CONSTRAINTS & INDEXES
-# Use ref_id as the SINGLE unique key for WCAGCriterion.
-# Also store 'code' as a synonym (same value), but ref_id is primary.
-# ============================================================
-print("\n📐 Creating constraints and indexes...")
-
-constraints = [
-    "CREATE CONSTRAINT IF NOT EXISTS FOR (p:WCAGPrinciple) REQUIRE p.ref_id IS UNIQUE",
-    "CREATE CONSTRAINT IF NOT EXISTS FOR (g:WCAGGuideline) REQUIRE g.ref_id IS UNIQUE",
-    "CREATE CONSTRAINT IF NOT EXISTS FOR (c:WCAGCriterion) REQUIRE c.ref_id IS UNIQUE",
-    "CREATE CONSTRAINT IF NOT EXISTS FOR (cl:ConformanceLevel) REQUIRE cl.name IS UNIQUE",
-    "CREATE INDEX IF NOT EXISTS FOR (c:WCAGCriterion) ON (c.code)",
-    "CREATE INDEX IF NOT EXISTS FOR (c:WCAGCriterion) ON (c.title)",
-    "CREATE INDEX IF NOT EXISTS FOR (c:WCAGCriterion) ON (c.level)",
-    "CREATE INDEX IF NOT EXISTS FOR (g:WCAGGuideline) ON (g.title)",
-    "CREATE INDEX IF NOT EXISTS FOR (p:WCAGPrinciple) ON (p.name)",
-]
-
-for c in constraints:
-    try:
-        run_write(c)
-    except Exception as e:
-        # Constraint may already exist, that's fine
-        if "already exists" not in str(e).lower():
-            print(f"   ⚠️  {e}")
-
-print("   ✅ Constraints and indexes ready")
+    def validate(self):
+        """Fail fast if required config is missing."""
+        missing = []
+        if not self.neo4j_uri:
+            missing.append("NEO4J_URI")
+        if not self.neo4j_user:
+            missing.append("NEO4J_USER")
+        if not self.neo4j_password:
+            missing.append("NEO4J_PASSWORD")
+        if missing:
+            raise EnvironmentError(
+                f"Missing required environment variables: {', '.join(missing)}. "
+                f"Check your .env file."
+            )
 
 
 # ============================================================
-# STEP 3: CONFORMANCE LEVELS
+# PIPELINE METRICS
 # ============================================================
-print("\n🏷️  Creating conformance level nodes...")
+@dataclass
+class PipelineMetrics:
+    """Track counts and timing across all phases."""
+    principles: int = 0
+    guidelines: int = 0
+    criteria: int = 0
+    special_cases: int = 0
+    notes: int = 0
+    references: int = 0
+    cross_refs: int = 0
+    phase_times: dict = field(default_factory=dict)
 
-for level, desc in [
-    ("A", "Minimum level of conformance"),
-    ("AA", "Addresses most common barriers — target for most organizations"),
-    ("AAA", "Highest level of conformance"),
-]:
-    run_write("""
-        MERGE (cl:ConformanceLevel {name: $level})
-        SET cl.description = $desc
-    """, {"level": level, "desc": desc})
-
-print("   ✅ Conformance levels: A, AA, AAA")
-
-
-# ============================================================
-# STEP 4: LOAD WCAG JSON
-# ============================================================
-print(f"\n📂 Loading {WCAG_JSON_FILE}...")
-
-try:
-    with open(WCAG_JSON_FILE, "r", encoding="utf-8") as f:
-        wcag_data = json.load(f)
-except FileNotFoundError:
-    print(f"   ❌ File not found: {WCAG_JSON_FILE}")
-    print(f"      Place your WCAG 2.2 JSON file in the same directory.")
-    sys.exit(1)
-
-print(f"   ✅ Loaded {len(wcag_data)} principles")
+    def summary(self) -> dict:
+        return {
+            k: v for k, v in self.__dict__.items()
+            if k != "phase_times"
+        }
 
 
 # ============================================================
-# STEP 5: CREATE PRINCIPLES → GUIDELINES → CRITERIA
+# NEO4J SESSION HELPERS
 # ============================================================
-counts = {
-    "principles": 0, "guidelines": 0, "criteria": 0,
-    "special_cases": 0, "notes": 0, "references": 0,
-}
+class Neo4jConnection:
+    """Managed Neo4j driver with batch-write support."""
 
-for principle in wcag_data:
-    # ── Principle ──
-    run_write("""
-        MERGE (p:WCAGPrinciple {ref_id: $ref_id})
-        SET p.name = $title,
-            p.title = $title,
-            p.description = $description,
-            p.url = $url
-    """, {
-        "ref_id": principle["ref_id"],
-        "title": principle["title"],
-        "description": principle["description"],
-        "url": principle["url"],
-    })
-    counts["principles"] += 1
-    print(f"\n   📌 Principle {principle['ref_id']}: {principle['title']}")
+    def __init__(self, config: PipelineConfig):
+        self.driver = GraphDatabase.driver(
+            config.neo4j_uri,
+            auth=(config.neo4j_user, config.neo4j_password),
+        )
+        self._verify_connectivity()
 
-    for guideline in principle.get("guidelines", []):
-        # ── Guideline ──
-        run_write("""
-            MERGE (g:WCAGGuideline {ref_id: $ref_id})
-            SET g.title = $title,
-                g.description = $description,
-                g.url = $url,
-                g.principle_id = $principle_id
+    def _verify_connectivity(self):
+        """Fail fast if Neo4j is unreachable."""
+        try:
+            self.driver.verify_connectivity()
+            log.info("Neo4j connectivity verified")
+        except Exception as e:
+            raise ConnectionError(f"Cannot reach Neo4j: {e}") from e
 
-            WITH g
-            MATCH (p:WCAGPrinciple {ref_id: $principle_id})
-            MERGE (g)-[:PART_OF]->(p)
-        """, {
-            "ref_id": guideline["ref_id"],
-            "title": guideline["title"],
-            "description": guideline["description"],
-            "url": guideline["url"],
-            "principle_id": principle["ref_id"],
+    def read(self, query: str, params: dict | None = None) -> list[dict]:
+        with self.driver.session() as session:
+            return [r.data() for r in session.run(query, params or {})]
+
+    def write(self, query: str, params: dict | None = None):
+        """Execute a single write query inside an explicit transaction."""
+        with self.driver.session() as session:
+            session.execute_write(lambda tx: tx.run(query, params or {}))
+
+    def batch_write(self, query: str, rows: list[dict]):
+        """Write many rows in a single UNWIND transaction (much faster)."""
+        if not rows:
+            return
+        with self.driver.session() as session:
+            session.execute_write(
+                lambda tx: tx.run(query, {"rows": rows})
+            )
+
+    def close(self):
+        self.driver.close()
+
+
+# ================================================================
+#  PHASE 0 — PRE-FLIGHT: Clean slate + schema constraints
+# ================================================================
+def phase_preflight(db: Neo4jConnection):
+    """Prepare the database: clean auxiliary nodes, ensure constraints."""
+    log.info("PHASE 0 ▸ Pre-flight checks")
+
+    # ── Clean auxiliary nodes (safe to recreate) ──
+    for label in ["WCAGSpecialCase", "WCAGNote", "WCAGReference"]:
+        db.write(f"MATCH (n:{label}) DETACH DELETE n")
+    log.info("  Cleaned auxiliary WCAG nodes")
+
+    # ── Constraints & indexes ──
+    schema_statements = [
+        "CREATE CONSTRAINT IF NOT EXISTS FOR (p:WCAGPrinciple)    REQUIRE p.ref_id IS UNIQUE",
+        "CREATE CONSTRAINT IF NOT EXISTS FOR (g:WCAGGuideline)    REQUIRE g.ref_id IS UNIQUE",
+        "CREATE CONSTRAINT IF NOT EXISTS FOR (c:WCAGCriterion)    REQUIRE c.ref_id IS UNIQUE",
+        "CREATE CONSTRAINT IF NOT EXISTS FOR (cl:ConformanceLevel) REQUIRE cl.name  IS UNIQUE",
+        "CREATE INDEX IF NOT EXISTS FOR (c:WCAGCriterion) ON (c.code)",
+        "CREATE INDEX IF NOT EXISTS FOR (c:WCAGCriterion) ON (c.title)",
+        "CREATE INDEX IF NOT EXISTS FOR (c:WCAGCriterion) ON (c.level)",
+        "CREATE INDEX IF NOT EXISTS FOR (g:WCAGGuideline) ON (g.title)",
+        "CREATE INDEX IF NOT EXISTS FOR (p:WCAGPrinciple) ON (p.name)",
+    ]
+    for stmt in schema_statements:
+        try:
+            db.write(stmt)
+        except Exception as e:
+            if "already exists" not in str(e).lower():
+                log.warning("  Schema issue: %s", e)
+    log.info("  Constraints and indexes ready")
+
+
+# ================================================================
+#  PHASE 1 — EXTRACT: Read + validate source JSON
+# ================================================================
+def phase_extract(config: PipelineConfig) -> list[dict]:
+    """Read the WCAG JSON file and validate its structure."""
+    log.info("PHASE 1 ▸ Extract — reading %s", config.wcag_json_file)
+
+    # ── Read file ──
+    if not os.path.isfile(config.wcag_json_file):
+        raise FileNotFoundError(
+            f"Source file not found: {config.wcag_json_file}. "
+            f"Place your WCAG 2.2 JSON in the project directory."
+        )
+
+    with open(config.wcag_json_file, "r", encoding="utf-8") as f:
+        raw_data = json.load(f)
+
+    # ── Structural validation ──
+    if not isinstance(raw_data, list) or len(raw_data) == 0:
+        raise ValueError("WCAG JSON must be a non-empty array of principles")
+
+    required_principle_keys = {"ref_id", "title", "description", "url", "guidelines"}
+    required_guideline_keys = {"ref_id", "title", "description", "url", "success_criteria"}
+    required_criterion_keys = {"ref_id", "title", "description", "url", "level"}
+
+    for p_idx, principle in enumerate(raw_data):
+        missing = required_principle_keys - set(principle.keys())
+        if missing:
+            raise ValueError(f"Principle [{p_idx}] missing keys: {missing}")
+
+        for g_idx, guideline in enumerate(principle.get("guidelines", [])):
+            missing = required_guideline_keys - set(guideline.keys())
+            if missing:
+                raise ValueError(
+                    f"Guideline [{p_idx}][{g_idx}] ({guideline.get('ref_id', '?')}) "
+                    f"missing keys: {missing}"
+                )
+
+            for sc_idx, sc in enumerate(guideline.get("success_criteria", [])):
+                missing = required_criterion_keys - set(sc.keys())
+                if missing:
+                    raise ValueError(
+                        f"Criterion [{p_idx}][{g_idx}][{sc_idx}] "
+                        f"({sc.get('ref_id', '?')}) missing keys: {missing}"
+                    )
+                if sc["level"] not in ("A", "AA", "AAA"):
+                    raise ValueError(
+                        f"Criterion {sc['ref_id']} has invalid level: {sc['level']}"
+                    )
+
+    log.info("  Validated %d principles — structure OK", len(raw_data))
+    return raw_data
+
+
+# ================================================================
+#  PHASE 2 — TRANSFORM: Flatten & normalize into batch-ready records
+# ================================================================
+@dataclass
+class TransformedData:
+    """All records normalized and ready for batch loading."""
+    conformance_levels: list[dict]
+    principles: list[dict]
+    guidelines: list[dict]
+    criteria: list[dict]
+    special_cases: list[dict]
+    notes: list[dict]
+    references: list[dict]        # node records
+    guideline_refs: list[dict]    # guideline → reference edges
+    criterion_refs: list[dict]    # criterion → reference edges
+    cross_refs: list[dict]        # criterion ↔ criterion/guideline edges
+
+
+def phase_transform(raw_data: list[dict], metrics: PipelineMetrics) -> TransformedData:
+    """Normalize raw JSON into flat, batch-ready record lists."""
+    log.info("PHASE 2 ▸ Transform — normalizing records")
+
+    # ── Static conformance levels ──
+    conformance_levels = [
+        {"name": "A",   "description": "Minimum level of conformance"},
+        {"name": "AA",  "description": "Addresses most common barriers — target for most organizations"},
+        {"name": "AAA", "description": "Highest level of conformance"},
+    ]
+
+    principles = []
+    guidelines = []
+    criteria = []
+    special_cases = []
+    notes_list = []
+    references = {}          # url → {title, url}  (deduplicated)
+    guideline_refs = []
+    criterion_refs = []
+
+    for principle in raw_data:
+        principles.append({
+            "ref_id": principle["ref_id"],
+            "title": principle["title"],
+            "description": principle["description"],
+            "url": principle["url"],
         })
-        counts["guidelines"] += 1
-        print(f"      📋 Guideline {guideline['ref_id']}: {guideline['title']}")
+        metrics.principles += 1
 
-        # Guideline references
-        for ref in guideline.get("references", []):
-            run_write("""
-                MATCH (g:WCAGGuideline {ref_id: $gid})
-                MERGE (r:WCAGReference {url: $url})
-                SET r.title = $title
-                MERGE (g)-[:HAS_REFERENCE]->(r)
-            """, {"gid": guideline["ref_id"], "title": ref["title"], "url": ref["url"]})
-            counts["references"] += 1
-
-        for sc in guideline.get("success_criteria", []):
-            # ── Criterion ──
-            # KEY: We set BOTH ref_id AND code to the same value.
-            # This prevents the v1 duplicate problem entirely.
-            run_write("""
-                MERGE (c:WCAGCriterion {ref_id: $ref_id})
-                SET c.code = $ref_id,
-                    c.title = $title,
-                    c.name = $title,
-                    c.description = $description,
-                    c.url = $url,
-                    c.level = $level,
-                    c.guideline_id = $guideline_id,
-                    c.principle_id = $principle_id,
-                    c.principle_title = $principle_title,
-                    c.guideline_title = $guideline_title,
-                    c.full_label = $ref_id + ' ' + $title + ' (Level ' + $level + ')'
-
-                WITH c
-                MATCH (g:WCAGGuideline {ref_id: $guideline_id})
-                MERGE (c)-[:PART_OF]->(g)
-
-                WITH c
-                MATCH (cl:ConformanceLevel {name: $level})
-                MERGE (c)-[:HAS_LEVEL]->(cl)
-            """, {
-                "ref_id": sc["ref_id"],
-                "title": sc["title"],
-                "description": sc["description"],
-                "url": sc["url"],
-                "level": sc["level"],
-                "guideline_id": guideline["ref_id"],
+        for guideline in principle.get("guidelines", []):
+            guidelines.append({
+                "ref_id": guideline["ref_id"],
+                "title": guideline["title"],
+                "description": guideline["description"],
+                "url": guideline["url"],
                 "principle_id": principle["ref_id"],
-                "principle_title": principle["title"],
-                "guideline_title": guideline["title"],
             })
-            counts["criteria"] += 1
+            metrics.guidelines += 1
 
-            # Special cases
-            for i, case in enumerate(sc.get("special_cases") or []):
-                run_write("""
-                    MATCH (c:WCAGCriterion {ref_id: $cid})
-                    CREATE (s:WCAGSpecialCase {
-                        criterion_id: $cid, index: $idx,
-                        type: $type, title: $title, description: $desc
-                    })
-                    CREATE (c)-[:HAS_SPECIAL_CASE]->(s)
-                """, {
-                    "cid": sc["ref_id"], "idx": i,
-                    "type": case.get("type", "unknown"),
-                    "title": case.get("title", ""),
-                    "desc": case.get("description", ""),
+            # Guideline-level references
+            for ref in guideline.get("references", []):
+                references[ref["url"]] = {"title": ref["title"], "url": ref["url"]}
+                guideline_refs.append({
+                    "guideline_id": guideline["ref_id"],
+                    "url": ref["url"],
+                    "title": ref["title"],
                 })
-                counts["special_cases"] += 1
+                metrics.references += 1
 
-            # Notes
-            for i, note in enumerate(sc.get("notes") or []):
-                run_write("""
-                    MATCH (c:WCAGCriterion {ref_id: $cid})
-                    CREATE (n:WCAGNote {
-                        criterion_id: $cid, index: $idx,
-                        content: $content
-                    })
-                    CREATE (c)-[:HAS_NOTE]->(n)
-                """, {
-                    "cid": sc["ref_id"], "idx": i,
-                    "content": note.get("content", ""),
+            for sc in guideline.get("success_criteria", []):
+                criteria.append({
+                    "ref_id": sc["ref_id"],
+                    "title": sc["title"],
+                    "description": sc["description"],
+                    "url": sc["url"],
+                    "level": sc["level"],
+                    "guideline_id": guideline["ref_id"],
+                    "principle_id": principle["ref_id"],
+                    "principle_title": principle["title"],
+                    "guideline_title": guideline["title"],
+                    "full_label": f"{sc['ref_id']} {sc['title']} (Level {sc['level']})",
                 })
-                counts["notes"] += 1
+                metrics.criteria += 1
 
-            # References
-            for ref in sc.get("references", []):
-                run_write("""
-                    MATCH (c:WCAGCriterion {ref_id: $cid})
-                    MERGE (r:WCAGReference {url: $url})
-                    SET r.title = $title
-                    MERGE (c)-[:HAS_REFERENCE]->(r)
-                """, {"cid": sc["ref_id"], "title": ref["title"], "url": ref["url"]})
-                counts["references"] += 1
+                # Special cases
+                for idx, case in enumerate(sc.get("special_cases") or []):
+                    special_cases.append({
+                        "criterion_id": sc["ref_id"],
+                        "index": idx,
+                        "type": case.get("type", "unknown"),
+                        "title": case.get("title", ""),
+                        "description": case.get("description", ""),
+                    })
+                    metrics.special_cases += 1
 
-            print(f"         ✅ {sc['ref_id']} {sc['title']} (Level {sc['level']})")
+                # Notes
+                for idx, note in enumerate(sc.get("notes") or []):
+                    notes_list.append({
+                        "criterion_id": sc["ref_id"],
+                        "index": idx,
+                        "content": note.get("content", ""),
+                    })
+                    metrics.notes += 1
+
+                # Criterion-level references
+                for ref in sc.get("references", []):
+                    references[ref["url"]] = {"title": ref["title"], "url": ref["url"]}
+                    criterion_refs.append({
+                        "criterion_id": sc["ref_id"],
+                        "url": ref["url"],
+                        "title": ref["title"],
+                    })
+                    metrics.references += 1
+
+    # ── Static cross-references ──
+    cross_refs = [
+        {"source": "1.3.3", "target": "1.4",   "rel": "RELATED_GUIDELINE", "desc": "For color requirements, refer to Guideline 1.4"},
+        {"source": "1.4.1", "target": "1.3",   "rel": "RELATED_GUIDELINE", "desc": "Other perception forms covered in Guideline 1.3"},
+        {"source": "2.2.1", "target": "3.2.1", "rel": "RELATED_CRITERION", "desc": "Consider in conjunction with 3.2.1"},
+        {"source": "2.2.2", "target": "2.3",   "rel": "RELATED_GUIDELINE", "desc": "For flickering content, refer to Guideline 2.3"},
+        {"source": "2.4.10","target": "4.1.2", "rel": "RELATED_CRITERION", "desc": "UI components covered under 4.1.2"},
+        {"source": "4.1.1", "target": "4.1.2", "rel": "RELATED_CRITERION", "desc": "Related parsing and name/role/value requirements"},
+        {"source": "1.1.1", "target": "4.1",   "rel": "RELATED_GUIDELINE", "desc": "Additional requirements for controls in Guideline 4.1"},
+        {"source": "1.1.1", "target": "1.2",   "rel": "RELATED_GUIDELINE", "desc": "Additional requirements for media in Guideline 1.2"},
+    ]
+    metrics.cross_refs = len(cross_refs)
+
+    log.info(
+        "  Transformed → %d principles, %d guidelines, %d criteria, "
+        "%d special cases, %d notes, %d references",
+        metrics.principles, metrics.guidelines, metrics.criteria,
+        metrics.special_cases, metrics.notes, metrics.references,
+    )
+
+    return TransformedData(
+        conformance_levels=conformance_levels,
+        principles=principles,
+        guidelines=guidelines,
+        criteria=criteria,
+        special_cases=special_cases,
+        notes=notes_list,
+        references=list(references.values()),
+        guideline_refs=guideline_refs,
+        criterion_refs=criterion_refs,
+        cross_refs=cross_refs,
+    )
 
 
-# ============================================================
-# STEP 6: CROSS-REFERENCES BETWEEN CRITERIA
-# ============================================================
-print("\n🔗 Creating cross-reference relationships...")
+# ================================================================
+#  PHASE 3 — LOAD: Batch-write into Neo4j
+# ================================================================
+def phase_load(db: Neo4jConnection, data: TransformedData):
+    """Load all transformed records into Neo4j using batched writes."""
+    log.info("PHASE 3 ▸ Load — writing to Neo4j")
 
-CROSS_REFS = [
-    ("1.3.3", "1.4", "RELATED_GUIDELINE", "For color requirements, refer to Guideline 1.4"),
-    ("1.4.1", "1.3", "RELATED_GUIDELINE", "Other perception forms covered in Guideline 1.3"),
-    ("2.2.1", "3.2.1", "RELATED_CRITERION", "Consider in conjunction with 3.2.1"),
-    ("2.2.2", "2.3", "RELATED_GUIDELINE", "For flickering content, refer to Guideline 2.3"),
-    ("2.4.10", "4.1.2", "RELATED_CRITERION", "UI components covered under 4.1.2"),
-    ("4.1.1", "4.1.2", "RELATED_CRITERION", "Related parsing and name/role/value requirements"),
-    ("1.1.1", "4.1", "RELATED_GUIDELINE", "Additional requirements for controls in Guideline 4.1"),
-    ("1.1.1", "1.2", "RELATED_GUIDELINE", "Additional requirements for media in Guideline 1.2"),
-]
+    # ── 3a. Conformance levels ──
+    db.batch_write("""
+        UNWIND $rows AS row
+        MERGE (cl:ConformanceLevel {name: row.name})
+        SET cl.description = row.description
+    """, data.conformance_levels)
+    log.info("  Loaded %d conformance levels", len(data.conformance_levels))
 
-for source, target, rel_type, desc in CROSS_REFS:
+    # ── 3b. Principles ──
+    db.batch_write("""
+        UNWIND $rows AS row
+        MERGE (p:WCAGPrinciple {ref_id: row.ref_id})
+        SET p.name        = row.title,
+            p.title       = row.title,
+            p.description = row.description,
+            p.url         = row.url
+    """, data.principles)
+    log.info("  Loaded %d principles", len(data.principles))
+
+    # ── 3c. Guidelines + PART_OF → Principle ──
+    db.batch_write("""
+        UNWIND $rows AS row
+        MERGE (g:WCAGGuideline {ref_id: row.ref_id})
+        SET g.title        = row.title,
+            g.description  = row.description,
+            g.url          = row.url,
+            g.principle_id = row.principle_id
+        WITH g, row
+        MATCH (p:WCAGPrinciple {ref_id: row.principle_id})
+        MERGE (g)-[:PART_OF]->(p)
+    """, data.guidelines)
+    log.info("  Loaded %d guidelines", len(data.guidelines))
+
+    # ── 3d. Criteria + PART_OF → Guideline + HAS_LEVEL → ConformanceLevel ──
+    db.batch_write("""
+        UNWIND $rows AS row
+        MERGE (c:WCAGCriterion {ref_id: row.ref_id})
+        SET c.code             = row.ref_id,
+            c.title            = row.title,
+            c.name             = row.title,
+            c.description      = row.description,
+            c.url              = row.url,
+            c.level            = row.level,
+            c.guideline_id     = row.guideline_id,
+            c.principle_id     = row.principle_id,
+            c.principle_title  = row.principle_title,
+            c.guideline_title  = row.guideline_title,
+            c.full_label       = row.full_label
+        WITH c, row
+        MATCH (g:WCAGGuideline {ref_id: row.guideline_id})
+        MERGE (c)-[:PART_OF]->(g)
+        WITH c, row
+        MATCH (cl:ConformanceLevel {name: row.level})
+        MERGE (c)-[:HAS_LEVEL]->(cl)
+    """, data.criteria)
+    log.info("  Loaded %d criteria", len(data.criteria))
+
+    # ── 3e. Special cases ──
+    if data.special_cases:
+        db.batch_write("""
+            UNWIND $rows AS row
+            MATCH (c:WCAGCriterion {ref_id: row.criterion_id})
+            CREATE (s:WCAGSpecialCase {
+                criterion_id: row.criterion_id,
+                index:        row.index,
+                type:         row.type,
+                title:        row.title,
+                description:  row.description
+            })
+            CREATE (c)-[:HAS_SPECIAL_CASE]->(s)
+        """, data.special_cases)
+    log.info("  Loaded %d special cases", len(data.special_cases))
+
+    # ── 3f. Notes ──
+    if data.notes:
+        db.batch_write("""
+            UNWIND $rows AS row
+            MATCH (c:WCAGCriterion {ref_id: row.criterion_id})
+            CREATE (n:WCAGNote {
+                criterion_id: row.criterion_id,
+                index:        row.index,
+                content:      row.content
+            })
+            CREATE (c)-[:HAS_NOTE]->(n)
+        """, data.notes)
+    log.info("  Loaded %d notes", len(data.notes))
+
+    # ── 3g. Reference nodes (deduplicated) ──
+    if data.references:
+        db.batch_write("""
+            UNWIND $rows AS row
+            MERGE (r:WCAGReference {url: row.url})
+            SET r.title = row.title
+        """, data.references)
+    log.info("  Loaded %d unique reference nodes", len(data.references))
+
+    # ── 3h. Guideline → Reference edges ──
+    if data.guideline_refs:
+        db.batch_write("""
+            UNWIND $rows AS row
+            MATCH (g:WCAGGuideline {ref_id: row.guideline_id})
+            MATCH (r:WCAGReference  {url:    row.url})
+            MERGE (g)-[:HAS_REFERENCE]->(r)
+        """, data.guideline_refs)
+    log.info("  Linked %d guideline references", len(data.guideline_refs))
+
+    # ── 3i. Criterion → Reference edges ──
+    if data.criterion_refs:
+        db.batch_write("""
+            UNWIND $rows AS row
+            MATCH (c:WCAGCriterion {ref_id: row.criterion_id})
+            MATCH (r:WCAGReference  {url:    row.url})
+            MERGE (c)-[:HAS_REFERENCE]->(r)
+        """, data.criterion_refs)
+    log.info("  Linked %d criterion references", len(data.criterion_refs))
+
+    # ── 3j. Cross-reference relationships ──
+    # These use two different rel types, so we handle them per-type
+    for rel_type in ("RELATED_CRITERION", "RELATED_GUIDELINE"):
+        batch = [r for r in data.cross_refs if r["rel"] == rel_type]
+        if not batch:
+            continue
+        # Parameterized relationship type requires separate queries
+        for row in batch:
+            try:
+                db.write(f"""
+                    MATCH (a:WCAGCriterion {{ref_id: $source}})
+                    MATCH (b) WHERE (b:WCAGCriterion OR b:WCAGGuideline)
+                          AND b.ref_id = $target
+                    MERGE (a)-[r:{rel_type}]->(b)
+                    SET r.description = $desc
+                """, {"source": row["source"], "target": row["target"], "desc": row["desc"]})
+            except Exception as e:
+                log.warning("  Cross-ref %s → %s failed: %s", row["source"], row["target"], e)
+    log.info("  Created %d cross-reference relationships", len(data.cross_refs))
+
+
+# ================================================================
+#  PHASE 4 — VALIDATE: Post-load integrity checks
+# ================================================================
+def phase_validate(db: Neo4jConnection, metrics: PipelineMetrics) -> bool:
+    """Run post-load integrity checks against Neo4j. Returns True if all pass."""
+    log.info("PHASE 4 ▸ Validate — integrity checks")
+    passed = True
+
+    # ── 4a. Node counts ──
+    node_stats = db.read("""
+        MATCH (n)
+        WHERE n:WCAGPrinciple OR n:WCAGGuideline OR n:WCAGCriterion
+           OR n:WCAGSpecialCase OR n:WCAGNote OR n:WCAGReference
+           OR n:ConformanceLevel
+        RETURN labels(n)[0] AS label, count(n) AS count
+        ORDER BY count DESC
+    """)
+    log.info("  Neo4j node counts:")
+    for row in node_stats:
+        log.info("    %-25s %d", row["label"], row["count"])
+
+    # ── 4b. Complete Criterion → Guideline → Principle chains ──
+    broken_chain = db.read("""
+        MATCH (c:WCAGCriterion)
+        WHERE NOT (c)-[:PART_OF]->(:WCAGGuideline)-[:PART_OF]->(:WCAGPrinciple)
+        RETURN c.ref_id AS ref_id, c.title AS title
+    """)
+    if broken_chain:
+        passed = False
+        log.error("  FAIL — %d criteria with broken hierarchy chain:", len(broken_chain))
+        for row in broken_chain:
+            log.error("    %s: %s", row["ref_id"], row["title"])
+    else:
+        log.info("  PASS — All %d criteria have complete Criterion → Guideline → Principle chains",
+                 metrics.criteria)
+
+    # ── 4c. code == ref_id on all criteria ──
+    mismatched = db.read("""
+        MATCH (c:WCAGCriterion)
+        WHERE c.code <> c.ref_id OR c.code IS NULL
+        RETURN c.ref_id AS ref_id, c.code AS code
+    """)
+    if mismatched:
+        passed = False
+        log.error("  FAIL — %d criteria have mismatched code/ref_id", len(mismatched))
+    else:
+        log.info("  PASS — All criteria have code == ref_id (no duplicate risk)")
+
+    # ── 4d. Every criterion has a conformance level ──
+    level_stats = db.read("""
+        MATCH (c:WCAGCriterion)-[:HAS_LEVEL]->(cl:ConformanceLevel)
+        WITH cl.name AS level, count(c) AS count
+        RETURN level, count
+        ORDER BY level
+    """)
+    total_leveled = sum(r["count"] for r in level_stats)
+    if total_leveled != metrics.criteria:
+        passed = False
+        log.error("  FAIL — %d/%d criteria linked to a conformance level",
+                  total_leveled, metrics.criteria)
+    else:
+        log.info("  PASS — Conformance level distribution:")
+        for row in level_stats:
+            log.info("    Level %-5s %d criteria", row["level"], row["count"])
+
+    return passed
+
+
+# ================================================================
+#  PIPELINE ORCHESTRATOR
+# ================================================================
+def run_pipeline():
+    """
+    Execute the full ETL pipeline with phase tracking, timing, and
+    structured error handling.
+    """
+    log.info("=" * 62)
+    log.info("  WCAG 2.2 Foundation — ETL Pipeline")
+    log.info("=" * 62)
+
+    pipeline_start = time.time()
+    config = PipelineConfig()
+    metrics = PipelineMetrics()
+    db = None
+
     try:
-        run_write(f"""
-            MATCH (a:WCAGCriterion {{ref_id: $source}})
-            MATCH (b) WHERE (b:WCAGCriterion OR b:WCAGGuideline) AND b.ref_id = $target
-            MERGE (a)-[r:{rel_type}]->(b)
-            SET r.description = $desc
-        """, {"source": source, "target": target, "desc": desc})
-        print(f"   ✅ {source} ──{rel_type}──▶ {target}")
+        # ── Config validation ──
+        config.validate()
+
+        # ── Connect ──
+        db = Neo4jConnection(config)
+
+        # ── Phase 0: Pre-flight ──
+        t0 = time.time()
+        phase_preflight(db)
+        metrics.phase_times["0_preflight"] = round(time.time() - t0, 2)
+
+        # ── Phase 1: Extract ──
+        t0 = time.time()
+        raw_data = phase_extract(config)
+        metrics.phase_times["1_extract"] = round(time.time() - t0, 2)
+
+        # ── Phase 2: Transform ──
+        t0 = time.time()
+        transformed = phase_transform(raw_data, metrics)
+        metrics.phase_times["2_transform"] = round(time.time() - t0, 2)
+
+        # ── Phase 3: Load ──
+        t0 = time.time()
+        phase_load(db, transformed)
+        metrics.phase_times["3_load"] = round(time.time() - t0, 2)
+
+        # ── Phase 4: Validate ──
+        t0 = time.time()
+        all_passed = phase_validate(db, metrics)
+        metrics.phase_times["4_validate"] = round(time.time() - t0, 2)
+
+        # ── Summary ──
+        total_time = round(time.time() - pipeline_start, 2)
+        log.info("")
+        log.info("=" * 62)
+        log.info("  PIPELINE COMPLETE — %.2fs total", total_time)
+        log.info("=" * 62)
+        log.info("  Phase timing:")
+        for phase, elapsed in metrics.phase_times.items():
+            log.info("    %-20s %.2fs", phase, elapsed)
+        log.info("")
+        log.info("  Record counts:")
+        for key, val in metrics.summary().items():
+            log.info("    %-20s %s", key, val)
+        log.info("")
+
+        if all_passed:
+            log.info("✅ All validation checks passed")
+            log.info("   Next: python 02_pipeline_etl_jira.py")
+        else:
+            log.warning("⚠️  Some validation checks failed — review logs above")
+            sys.exit(1)
+
+    except (EnvironmentError, ConnectionError) as e:
+        log.error("PIPELINE ABORTED (config/connection): %s", e)
+        sys.exit(1)
+    except FileNotFoundError as e:
+        log.error("PIPELINE ABORTED (extract): %s", e)
+        sys.exit(1)
+    except ValueError as e:
+        log.error("PIPELINE ABORTED (validation): %s", e)
+        sys.exit(1)
     except Exception as e:
-        print(f"   ⚠️  {source} → {target}: {e}")
+        log.error("PIPELINE ABORTED (unexpected): %s", e, exc_info=True)
+        sys.exit(1)
+    finally:
+        if db:
+            db.close()
+            log.info("Neo4j connection closed")
 
 
-# ============================================================
-# STEP 7: VERIFICATION
-# ============================================================
-print("\n" + "=" * 60)
-print("📊 WCAG FOUNDATION — VERIFICATION")
-print("=" * 60)
-
-print(f"\n   Loaded from JSON:")
-for k, v in counts.items():
-    print(f"   {k:<20} {v}")
-
-# Verify in Neo4j
-node_stats = run_query("""
-    MATCH (n)
-    WHERE n:WCAGPrinciple OR n:WCAGGuideline OR n:WCAGCriterion
-       OR n:WCAGSpecialCase OR n:WCAGNote OR n:WCAGReference
-       OR n:ConformanceLevel
-    RETURN labels(n)[0] AS label, count(n) AS count
-    ORDER BY count DESC
-""")
-print(f"\n   Neo4j Node Counts:")
-for row in node_stats:
-    print(f"   {row['label']:<25} {row['count']}")
-
-# Verify all criteria have PART_OF → Guideline → Principle chain
-broken_chain = run_query("""
-    MATCH (c:WCAGCriterion)
-    WHERE NOT (c)-[:PART_OF]->(:WCAGGuideline)-[:PART_OF]->(:WCAGPrinciple)
-    RETURN c.ref_id AS ref_id, c.title AS title
-""")
-if broken_chain:
-    print(f"\n   ⚠️  Criteria with broken guideline/principle chain:")
-    for row in broken_chain:
-        print(f"      {row['ref_id']}: {row['title']}")
-else:
-    print(f"\n   ✅ All {counts['criteria']} criteria have complete Criterion → Guideline → Principle chains")
-
-# Verify code == ref_id on all criteria
-mismatched = run_query("""
-    MATCH (c:WCAGCriterion)
-    WHERE c.code <> c.ref_id OR c.code IS NULL
-    RETURN c.ref_id AS ref_id, c.code AS code
-""")
-if mismatched:
-    print(f"   ⚠️  {len(mismatched)} criteria have mismatched code/ref_id")
-else:
-    print(f"   ✅ All criteria have code == ref_id (no future duplicate risk)")
-
-level_stats = run_query("""
-    MATCH (c:WCAGCriterion)-[:HAS_LEVEL]->(cl:ConformanceLevel)
-    WITH cl.name AS level, count(c) AS count
-    RETURN level, count
-    ORDER BY level
-""")
-print(f"\n   By Conformance Level:")
-for row in level_stats:
-    print(f"   Level {row['level']:<5} {row['count']} criteria")
-
-driver.close()
-print("\n✅ WCAG Foundation loaded successfully!")
-print("   Next: python pipeline_step2_etl_jira.py")
+# ================================================================
+#  ENTRY POINT
+# ================================================================
+if __name__ == "__main__":
+    run_pipeline()
