@@ -1,12 +1,10 @@
-# Neo4j Database Driver
+# ── Neo4j ETL Pipeline ──
 neo4j>=5.0.0
-
-# Environment Variable Management
 python-dotenv>=1.0.0
 
-# WCAG JSON Enrichment (00_enrich_wcag_json.py)
+# ── WCAG Enrichment Scraper ──
 requests>=2.31.0
 beautifulsoup4>=4.12.0
 
-# JSON handling (included in Python standard library, listed for clarity)
-# json - built-in
+# ── Agentic RAG ──
+openai>=1.0.0          # LLM client (also works with Ollama/Anthropic via base_url)
