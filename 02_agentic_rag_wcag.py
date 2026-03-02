@@ -35,6 +35,7 @@ Usage:
 """
 
 import os
+import sys
 import json
 import logging
 import time
@@ -69,10 +70,13 @@ class AgentConfig:
     neo4j_uri: str = os.getenv("NEO4J_URI", "")
     neo4j_user: str = os.getenv("NEO4J_USER", "")
     neo4j_password: str = os.getenv("NEO4J_PASSWORD", "")
-    llm_provider: str = os.getenv("LLM_PROVIDER", "openai")  # openai | ollama | anthropic
+    llm_provider: str = os.getenv("LLM_PROVIDER", "azure_openai")  # azure_openai | openai | ollama | anthropic
     llm_model: str = os.getenv("LLM_MODEL", "gpt-4o")
     llm_api_key: str = os.getenv("OPENAI_API_KEY", "")
     llm_base_url: str = os.getenv("LLM_BASE_URL", "")  # For Ollama: http://localhost:11434/v1
+    azure_openai_endpoint: str = os.getenv("AZURE_OPENAI_ENDPOINT", "")
+    azure_openai_api_version: str = os.getenv("AZURE_OPENAI_API_VERSION", "2024-05-01-preview")
+    azure_openai_deployment: str = os.getenv("AZURE_OPENAI_DEPLOYMENT", "")
     max_agent_steps: int = int(os.getenv("MAX_AGENT_STEPS", "10"))
     max_context_tokens: int = int(os.getenv("MAX_CONTEXT_TOKENS", "6000"))
     embedding_model: str = os.getenv("EMBEDDING_MODEL", "text-embedding-3-small")
@@ -1248,6 +1252,7 @@ class WCAGAgent:
         self.db = db
         self.tools: dict[str, BaseTool] = {}
         self.llm_client = None
+        self._llm_model_name: str = config.llm_model  # may be overridden by _init_llm
 
         # Register all tools
         self._register_tools()
@@ -1272,20 +1277,45 @@ class WCAGAgent:
 
     def _init_llm(self):
         """Initialize LLM client if API key is available."""
-        if not self.config.llm_api_key and not self.config.llm_base_url:
+        if not self.config.llm_api_key and not self.config.llm_base_url and not self.config.azure_openai_endpoint:
             log.info("  No LLM configured — using rule-based routing")
             return
 
         try:
-            from openai import OpenAI
+            provider = self.config.llm_provider.lower()
 
-            client_kwargs = {"api_key": self.config.llm_api_key}
-            if self.config.llm_base_url:
-                client_kwargs["base_url"] = self.config.llm_base_url
+            if provider == "azure_openai":
+                from openai import AzureOpenAI
 
-            self.llm_client = OpenAI(**client_kwargs)
-            log.info("  LLM initialized: %s (%s)",
-                     self.config.llm_model, self.config.llm_provider)
+                if not self.config.azure_openai_endpoint:
+                    log.warning("  AZURE_OPENAI_ENDPOINT not set — using rule-based routing")
+                    return
+
+                self.llm_client = AzureOpenAI(
+                    api_key=self.config.llm_api_key,
+                    azure_endpoint=self.config.azure_openai_endpoint,
+                    api_version=self.config.azure_openai_api_version,
+                )
+                # For Azure, the "model" param in chat.completions.create
+                # must be the deployment name, not the model name
+                self._llm_model_name = (
+                    self.config.azure_openai_deployment
+                    or self.config.llm_model
+                )
+                log.info("  LLM initialized: Azure OpenAI — deployment=%s, endpoint=%s",
+                         self._llm_model_name, self.config.azure_openai_endpoint)
+            else:
+                from openai import OpenAI
+
+                client_kwargs = {"api_key": self.config.llm_api_key}
+                if self.config.llm_base_url:
+                    client_kwargs["base_url"] = self.config.llm_base_url
+
+                self.llm_client = OpenAI(**client_kwargs)
+                self._llm_model_name = self.config.llm_model
+                log.info("  LLM initialized: %s (%s)",
+                         self._llm_model_name, provider)
+
         except ImportError:
             log.warning("  openai package not installed — using rule-based routing")
         except Exception as e:
@@ -1357,7 +1387,7 @@ class WCAGAgent:
                 log.info("  ACT   → %s(%s)", tool_name, tool_params)
 
             result = self.tools[tool_name].execute(**tool_params)
-            collected_context.append(result.to_context())
+            collected_context.append(result)
             trace.tools_called.append(tool_name)
 
             trace.steps.append(AgentStep(
@@ -1384,7 +1414,7 @@ class WCAGAgent:
                     ctx_result = self.tools["context_assembler"].execute(
                         criterion_ids=ids_to_assemble,
                     )
-                    collected_context.append(ctx_result.to_context())
+                    collected_context.append(ctx_result)
                     trace.tools_called.append("context_assembler")
 
                     trace.steps.append(AgentStep(
@@ -1615,22 +1645,154 @@ class WCAGAgent:
                     ids.append(str(value))
         return list(dict.fromkeys(ids))  # deduplicate preserving order
 
-    def _build_response(self, query: str, contexts: list[str],
+    def _build_response(self, query: str, tool_results: list,
                          analysis: dict) -> str:
-        """Build a structured response from collected tool contexts."""
-        response_parts = [
-            f"## WCAG 2.2 Knowledge Graph Response",
-            f"**Query:** {query}",
-            f"**Intent detected:** {analysis.get('intent', 'unknown')}",
-            f"**Tools used:** {len(contexts)}",
-            "",
-        ]
+        """Build a clean, human-readable response from collected tool results.
 
-        for ctx in contexts:
-            response_parts.append(ctx)
-            response_parts.append("")
+        Accepts either ToolResult objects or pre-formatted strings for
+        backwards compatibility.
+        """
+        separator = "─" * 62
+        double_sep = "═" * 62
+        lines: list[str] = []
 
-        return "\n".join(response_parts)
+        lines.append("")
+        lines.append(double_sep)
+        lines.append(f"  WCAG 2.2 — Response")
+        lines.append(double_sep)
+        lines.append(f"  Query:  {query}")
+        lines.append(f"  Intent: {analysis.get('intent', 'unknown')}")
+        lines.append(separator)
+        lines.append("")
+
+        for item in tool_results:
+            # ── Handle ToolResult objects ──
+            if isinstance(item, ToolResult):
+                if not item.success:
+                    lines.append(f"  ⚠ {item.tool_name}: {item.error}")
+                    lines.append("")
+                    continue
+
+                data = item.data
+
+                # Context assembler — use its already-formatted output
+                if item.tool_name == "context_assembler" and isinstance(data, dict):
+                    formatted = data.get("formatted_context", "")
+                    if formatted:
+                        lines.append(formatted)
+                        continue
+
+                # Semantic search — list of criteria
+                if item.tool_name == "semantic_search" and isinstance(data, list):
+                    lines.append("  📋 Relevant Criteria Found:")
+                    lines.append("")
+                    for i, row in enumerate(data, 1):
+                        ref = row.get("ref_id", "?")
+                        title = row.get("title", "?")
+                        level = row.get("level", "?")
+                        desc = row.get("description", "")
+                        if len(desc) > 200:
+                            desc = desc[:200].rsplit(" ", 1)[0] + "…"
+                        lines.append(f"  {i}. [{ref}] {title}  (Level {level})")
+                        lines.append(f"     {desc}")
+                        lines.append("")
+                    continue
+
+                # Graph traversal — hierarchy, guidelines, criteria lists
+                if item.tool_name == "graph_traversal" and isinstance(data, list):
+                    lines.append("  🔗 Graph Results:")
+                    lines.append("")
+                    for row in data:
+                        ref = row.get("ref_id", "")
+                        title = row.get("title", row.get("name", ""))
+                        level = row.get("level", "")
+                        level_str = f"  (Level {level})" if level else ""
+                        lines.append(f"  • [{ref}] {title}{level_str}")
+                    lines.append("")
+                    continue
+
+                # Technique finder — grouped by category
+                if item.tool_name == "technique_finder" and isinstance(data, dict):
+                    lines.append("  🛠 Techniques:")
+                    lines.append("")
+                    for category, label_icon in [("sufficient", "✅"), ("advisory", "💡"), ("failures", "❌")]:
+                        techs = data.get(category, [])
+                        if techs:
+                            label = category.replace("_", " ").title()
+                            lines.append(f"  {label}:")
+                            for t in techs:
+                                tid = t.get("tech_id", "")
+                                tt = t.get("title", "")
+                                lines.append(f"    {label_icon} [{tid}] {tt}")
+                            lines.append("")
+                    continue
+
+                # Rule engine — criteria list with optional grouping
+                if item.tool_name == "rule_engine" and isinstance(data, (dict, list)):
+                    lines.append("  📏 Rule Engine Results:")
+                    lines.append("")
+                    if isinstance(data, dict):
+                        rules = data.get("rules", data.get("criteria", data.get("checklist", [])))
+                        if isinstance(rules, list):
+                            for row in rules:
+                                ref = row.get("ref_id", "?")
+                                title = row.get("title", "?")
+                                level = row.get("level", "")
+                                level_str = f"  (Level {level})" if level else ""
+                                lines.append(f"  • [{ref}] {title}{level_str}")
+                        else:
+                            for key, val in data.items():
+                                lines.append(f"  {key}: {val}")
+                    elif isinstance(data, list):
+                        for row in data:
+                            ref = row.get("ref_id", "?")
+                            title = row.get("title", "?")
+                            level = row.get("level", "")
+                            level_str = f"  (Level {level})" if level else ""
+                            lines.append(f"  • [{ref}] {title}{level_str}")
+                    lines.append("")
+                    continue
+
+                # Impact analysis — formatted matrix/list
+                if item.tool_name == "impact_analysis" and isinstance(data, (dict, list)):
+                    lines.append("  ♿ Impact Analysis:")
+                    lines.append("")
+                    if isinstance(data, dict):
+                        for key, val in data.items():
+                            if isinstance(val, list):
+                                lines.append(f"  {key}:")
+                                for v in val:
+                                    if isinstance(v, dict):
+                                        ref = v.get("ref_id", "?")
+                                        title = v.get("title", "?")
+                                        lines.append(f"    • [{ref}] {title}")
+                                    else:
+                                        lines.append(f"    • {v}")
+                            else:
+                                lines.append(f"  {key}: {val}")
+                    elif isinstance(data, list):
+                        for row in data:
+                            ref = row.get("ref_id", "?")
+                            title = row.get("title", "?")
+                            lines.append(f"  • [{ref}] {title}")
+                    lines.append("")
+                    continue
+
+                # Fallback for any other tool — compact JSON
+                lines.append(f"  [{item.tool_name}]:")
+                text = json.dumps(data, indent=2, default=str)
+                if len(text) > 1000:
+                    text = text[:1000] + "\n  ... (truncated)"
+                lines.append(text)
+                lines.append("")
+
+            # ── Handle legacy strings (backwards compat) ──
+            elif isinstance(item, str):
+                lines.append(item)
+                lines.append("")
+
+        lines.append(double_sep)
+        return "\n".join(lines)
 
     # ────────────────────────────────────────────
     # LLM-POWERED AGENTIC LOOP (with function calling)
@@ -1657,7 +1819,7 @@ class WCAGAgent:
 
             try:
                 response = self.llm_client.chat.completions.create(
-                    model=self.config.llm_model,
+                    model=self._llm_model_name,
                     messages=messages,
                     tools=tools_schema,
                     tool_choice="auto",
