@@ -1,6 +1,6 @@
 # Neo4j Agentic GraphRAG for WCAG 2.2
 
-> **An AI Agent that reasons over a WCAG 2.2 Knowledge Graph to answer accessibility compliance questions — powered by Neo4j, a 5-phase ETL pipeline, and a ReAct (Reasoning + Acting) agent with 8 specialized tools.**
+> **An AI Agent that reasons over a WCAG 2.2 Knowledge Graph to answer accessibility compliance questions — powered by Neo4j, a 5-phase ETL pipeline, and a ReAct (Reasoning + Acting) agent with 9 specialized tools, LLM-powered query decomposition, and dynamic Cypher generation with guardrails.**
 
 ---
 
@@ -29,8 +29,8 @@ This project builds an **Agentic RAG (Retrieval-Augmented Generation)** system o
 │  │  _wcag_to      │───▶│  _foundation.py     │─▶│  .py                  │ │
 │  │  _csv.py       │    │                     │  │                        │ │
 │  │ Scrape W3C    │    │ Extract → Transform │  │ ReAct Agent with      │ │
-│  │ Understanding │    │ → Load → Validate   │  │ 8 tools over Neo4j    │ │
-│  │ pages         │    │ into Neo4j KG       │  │ Knowledge Graph       │ │
+│  │ Understanding │    │ → Load → Validate   │  │ 9 tools + decomposer  │ │
+│  │ pages         │    │ into Neo4j KG       │  │ over Neo4j KG         │ │
 │  └───────────────┘    └─────────────────────┘  └────────────────────────┘ │
 │         │                       │                         │                │
 │         ▼                       ▼                         ▼                │
@@ -61,25 +61,24 @@ The agent follows a **ReAct (Reasoning + Acting)** loop — it doesn't just retr
 │                      WCAG AGENT (Orchestrator)                   │
 │                                                                  │
 │   ┌─────────────────────────────────────────────────────────┐   │
-│   │  1. THINK   — Analyze query, identify intent & entities  │   │
+│   │  0. DECOMPOSE — Break query into prioritized sub-steps   │   │
+│   │  1. THINK   — Analyze each sub-step, plan tool calls     │   │
 │   │  2. ACT     — Call one or more specialized tools         │   │
-│   │  3. OBSERVE — Process results, decide if more is needed  │   │
-│   │  4. REPEAT  — Loop until context is sufficient           │   │
+│   │  3. OBSERVE — Process results, resolve dependencies      │   │
+│   │  4. REPEAT  — Loop until all sub-steps completed         │   │
 │   │  5. RESPOND — Synthesize answer with graph citations     │   │
 │   └─────────────────────────────────────────────────────────┘   │
-│           │          │          │          │          │          │
-│    ┌──────▼──┐ ┌────▼─────┐ ┌─▼──────┐ ┌▼────────┐ │          │
-│    │ Graph   │ │ Semantic │ │Technique│ │ Rule    │ │          │
-│    │Traversal│ │ Search   │ │ Finder  │ │ Engine  │ │          │
-│    └─────────┘ └──────────┘ └────────┘ └─────────┘ │          │
-│    ┌─────────┐ ┌──────────┐ ┌──────────────┐       │          │
-│    │ Impact  │ │ Key Term │ │Cross-        │       │          │
-│    │Analysis │ │ Lookup   │ │Reference     │       │          │
-│    └─────────┘ └──────────┘ └──────────────┘       │          │
-│                   ┌──────────────┐                   │          │
-│                   │   Context    │◀──────────────────┘          │
-│                   │  Assembler   │  (final step: always)        │
-│                   └──────────────┘                               │
+│          │         │          │          │          │            │
+│   ┌──────▼──┐ ┌───▼──────┐ ┌▼───────┐ ┌▼────────┐ ┌▼────────┐ │
+│   │ Graph   │ │ Semantic │ │Technique│ │ Rule    │ │ Impact  │ │
+│   │Traversal│ │ Search   │ │ Finder  │ │ Engine  │ │Analysis │ │
+│   └─────────┘ └──────────┘ └────────┘ └─────────┘ └─────────┘ │
+│   ┌─────────┐ ┌──────────┐ ┌──────────┐ ┌────────────────┐     │
+│   │Key Term │ │ Cross-   │ │ Dynamic  │ │   Context      │     │
+│   │ Lookup  │ │Reference │ │ Cypher   │ │  Assembler     │     │
+│   └─────────┘ └──────────┘ │(LLM+guard│ └────────────────┘     │
+│                             │  rails)  │                        │
+│                             └──────────┘                        │
 │                │               │                                │
 │                └───────┬───────┘                                │
 │                        ▼                                        │
@@ -99,12 +98,12 @@ The agent works **with or without an LLM**:
 
 | Mode | Requirements | How It Decides Which Tool to Call |
 |------|-------------|----------------------------------|
-| **Rule-Based** | Neo4j only | Pattern matching + keyword analysis routes queries deterministically |
-| **LLM-Powered** | Neo4j + OpenAI / Ollama / Anthropic | LLM uses function calling to dynamically select tools |
+| **Rule-Based** | Neo4j only | QueryDecomposer (heuristic) + StepExecutor — pattern matching creates a prioritized plan |
+| **LLM-Powered** | Neo4j + OpenAI / Ollama / Anthropic | QueryDecomposer (LLM) creates a plan → LLM uses function calling to execute it, with dynamic Cypher for ad-hoc queries |
 
-Rule-based mode is ideal for testing, CI pipelines, and environments without LLM access. The LLM mode adds natural language understanding and more nuanced tool orchestration.
+Rule-based mode is ideal for testing, CI pipelines, and environments without LLM access. The LLM mode adds natural language understanding, dynamic Cypher generation, and more nuanced tool orchestration.
 
-### 8 Specialized Tools
+### 9 Specialized Tools
 
 Each tool is backed by targeted Cypher queries against the WCAG Knowledge Graph:
 
@@ -117,7 +116,8 @@ Each tool is backed by targeted Cypher queries against the WCAG Knowledge Graph:
 | 5 | **`impact_analysis`** | Disability and input modality impact analysis | "Which criteria affect blind users?", "Keyboard-only requirements" |
 | 6 | **`key_term_lookup`** | Look up WCAG key term definitions from 725 formal terms | "What does programmatically determined mean?", "Define text alternative" |
 | 7 | **`cross_reference`** | Multi-hop graph walks: related chains, shared techniques, disability overlap, ripple effects | "If I fix 2.1.1, what else improves?", "Overlap between blindness and motor?" |
-| 8 | **`context_assembler`** | Builds LLM-ready structured context from full graph subgraphs including key terms and related resources | Auto-called as final step to assemble response context |
+| 8 | **`dynamic_cypher`** | LLM-generated Cypher with guardrails for ad-hoc analytical queries | "Which criteria have more than 5 techniques?", "Count techniques per technology" |
+| 9 | **`context_assembler`** | Builds LLM-ready structured context from full graph subgraphs including key terms and related resources | Auto-called as final step to assemble response context |
 
 ### Agent Usage
 
@@ -153,6 +153,10 @@ python 02_agentic_rag_wcag.py --interactive
 🔍 Which criteria overlap between color blindness and low vision?
 🔍 What does technique H37 cover?
 🔍 What shared techniques apply to both 1.1.1 and 4.1.2?
+🔍 Which criteria have more than 5 techniques?    ← dynamic_cypher
+🔍 Show me criteria WITHOUT test rules             ← dynamic_cypher
+🔍 Count techniques per technology type             ← dynamic_cypher
+🔍 Audit a login form with images, inputs, buttons ← multi-step decomposition
 ```
 
 ### Example Agent Traces
@@ -235,11 +239,82 @@ COMPLETED in 0.34s (4 steps, tools: [rule_engine, context_assembler])
 ──────────────────────────────────────────────────
 ```
 
+### Query Decomposition & Planning
+
+Complex queries are automatically broken into **prioritized sub-steps** before execution:
+
+```
+User: "Audit a login form with images, inputs, and buttons"
+                          │
+                          ▼
+              ┌─────────────────────────┐
+              │   QueryDecomposer       │
+              │  (LLM or heuristic)     │
+              └────────┬────────────────┘
+                       │
+        ┌──────────────┼──────────────────┐
+        ▼              ▼                  ▼
+   Step 1 [P1]    Step 2 [P1]       Step 3 [P1]
+   rule_engine     rule_engine       rule_engine
+   (image rules)   (form rules)     (button rules)
+        │              │                  │
+        └──────────────┼──────────────────┘
+                       ▼
+               Step 4 [P2] (depends on 1,2,3)
+               context_assembler
+               (union of all criteria found)
+                       │
+                       ▼
+               Synthesized Response
+```
+
+**How it works:**
+1. **QueryDecomposer** breaks the query into steps, each with: tool name, parameters, dependencies, and priority
+2. **StepExecutor** runs steps in dependency/priority order, passing intermediate results between steps
+3. Results from earlier steps (e.g., criterion IDs) automatically flow into dependent steps
+4. The LLM can deviate from the plan if intermediate results suggest a better path
+
+### Dynamic Cypher Tool (Guardrails)
+
+Tool 8 (`dynamic_cypher`) lets the LLM generate ad-hoc Cypher for questions the pre-built templates can't handle:
+
+```
+User: "Which criteria have more than 5 techniques?"
+                          │
+                          ▼
+              ┌───────────────────────┐
+              │  DynamicCypherTool    │
+              │                       │
+              │  1. LLM generates     │──→ MATCH (c:WCAGCriterion)-[:HAS_TECHNIQUE]->(t)
+              │     Cypher            │    WITH c, count(t) AS cnt
+              │                       │    WHERE cnt > 5
+              │  2. Guardrail check   │    RETURN c.ref_id, c.title, cnt
+              │     ├ READ-ONLY? ✅   │    ORDER BY cnt DESC
+              │     ├ Schema OK? ✅   │    LIMIT 50
+              │     ├ No APOC? ✅     │
+              │     └ LIMIT added? ✅ │
+              │                       │
+              │  3. Execute safely    │
+              └───────────────────────┘
+```
+
+**5 Guardrails enforced on every dynamic query:**
+
+| Guard | What It Blocks | Example |
+|-------|---------------|---------|
+| **Mutation Keywords** | CREATE, DELETE, SET, MERGE, REMOVE, DROP, DETACH | `CREATE (n:Bad) RETURN n` → ❌ |
+| **Node Label Allowlist** | Only 13 known WCAG node types | `MATCH (n:FakeNode)` → ❌ |
+| **Relationship Allowlist** | Only 15 known relationship types | `[:UNKNOWN_REL]` → ❌ |
+| **Procedure Block** | No APOC, GDS, db.*, dbms.* calls | `CALL apoc.meta.data()` → ❌ |
+| **Result Limit** | LIMIT 50 auto-injected if missing | Prevents unbounded scans |
+
 ### Why Agentic RAG > Plain RAG
 
 | Capability | Plain Vector RAG | Plain GraphRAG | **Agentic GraphRAG** |
 |-----------|-----------------|----------------|---------------------|
 | Multi-step reasoning | ❌ Single retrieval | ❌ Single query | ✅ Iterative tool loop |
+| Query decomposition | ❌ | ❌ | ✅ LLM + heuristic planner |
+| Dynamic Cypher | ❌ | ⚠️ Manual | ✅ LLM-generated with guardrails |
 | Relationship traversal | ❌ Lost in chunks | ✅ Cypher queries | ✅ + Agent decides depth |
 | Dynamic tool selection | ❌ Fixed pipeline | ❌ Fixed query | ✅ Agent plans per query |
 | Technique lookup | ❌ Embedded in text | ⚠️ Manual query | ✅ Dedicated tool |
@@ -247,6 +322,7 @@ COMPLETED in 0.34s (4 steps, tools: [rule_engine, context_assembler])
 | Terminology resolution | ❌ Not indexed | ⚠️ Manual query | ✅ 725 key terms searchable |
 | Cross-reference analysis | ❌ Lost | ⚠️ Manual multi-query | ✅ Multi-hop graph walks |
 | Ripple effect mapping | ❌ Impossible | ⚠️ Complex Cypher | ✅ One-step tool call |
+| Ad-hoc analytics | ❌ | ⚠️ Write Cypher manually | ✅ Natural language → safe Cypher |
 | Reasoning transparency | ❌ Black box | ❌ No trace | ✅ Full `AgentTrace` log |
 | Works without LLM | N/A (requires LLM) | ✅ (Cypher only) | ✅ Rule-based fallback |
 | Context assembly | Token-limited chunks | Manual RETURN clause | ✅ Auto-assembled with key terms + resources |
@@ -830,6 +906,8 @@ The pipeline creates:
 - ✅ **Cypher Visibility**: Each tool exposes the Cypher query it ran
 - ✅ **Verbose Mode**: `--verbose` flag shows real-time reasoning
 - ✅ **Trace Command**: Type `trace` in interactive mode to inspect last query's steps
+- ✅ **Query Plans**: Decomposed plans visible in trace with step dependencies and priorities
+- ✅ **Dynamic Cypher Audit**: Every LLM-generated Cypher shown in output with guardrail status
 
 ---
 
@@ -902,7 +980,8 @@ Contributions are welcome! Areas for improvement:
 - JIRA / Confluence connectors
 - Scenario evaluation engine (URL/screenshot → audit checklist)
 - Additional agent tools (e.g., code snippet generator, ARIA pattern recommender)
-- Test coverage for all 8 agent tools
+- Test coverage for all 9 agent tools + guardrail validation
+- Enhanced query decomposition with parallel step execution
 
 ---
 
