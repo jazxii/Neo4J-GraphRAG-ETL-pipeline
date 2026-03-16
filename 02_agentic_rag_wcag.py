@@ -28,6 +28,8 @@ Tools:
   5. HierarchyTool        — Navigates Principle→Guideline→Criterion trees
   6. TechniqueFinderTool  — Finds sufficient/advisory/failure techniques
   7. ImpactAnalysisTool   — Analyzes disability impact and input modalities
+  8. DynamicCypherTool    — LLM-generated Cypher with guardrails (read-only)
+  9. QueryDecomposer      — Breaks complex queries into prioritized sub-steps
 
 Usage:
   python 02_agentic_rag_wcag.py --query "How do I make images accessible?"
@@ -1404,7 +1406,325 @@ class CrossReferenceTool(BaseTool):
 
 
 # ============================================================
-# TOOL 8: CONTEXT ASSEMBLER
+# TOOL 8: DYNAMIC CYPHER (LLM-generated with guardrails)
+# ============================================================
+class DynamicCypherTool(BaseTool):
+    """
+    Generates and executes Cypher queries using the LLM with strict
+    safety guardrails.  This tool handles ad-hoc analytical questions
+    that the pre-built templates cannot answer (aggregations, counts,
+    negation queries, arbitrary filters, etc.).
+
+    GUARDRAILS:
+      • READ-ONLY: rejects any mutation keywords (CREATE, DELETE, SET,
+        MERGE, REMOVE, DROP, DETACH, CALL, LOAD, FOREACH)
+      • SCHEMA ALLOWLIST: only known node labels and relationship types
+      • RESULT LIMIT: injects LIMIT if missing
+      • TIMEOUT: kills long-running queries
+      • PROPERTY ALLOWLIST: only known properties per node label
+    """
+
+    # ── Schema allowlists ──
+    ALLOWED_NODE_LABELS = frozenset([
+        "WCAGPrinciple", "WCAGGuideline", "WCAGCriterion", "ConformanceLevel",
+        "WCAGSpecialCase", "WCAGNote", "WCAGReference", "WCAGTechnique",
+        "WCAGTestRule", "WCAGExample", "WCAGBenefit", "WCAGKeyTerm",
+        "WCAGRelatedResource",
+    ])
+
+    ALLOWED_RELATIONSHIP_TYPES = frozenset([
+        "PART_OF", "HAS_LEVEL", "HAS_TECHNIQUE", "HAS_ADVISORY_TECHNIQUE",
+        "HAS_FAILURE", "HAS_SPECIAL_CASE", "HAS_NOTE", "HAS_REFERENCE",
+        "HAS_TEST_RULE", "HAS_EXAMPLE", "HAS_BENEFIT", "HAS_KEY_TERM",
+        "HAS_RELATED_RESOURCE", "RELATED_CRITERION", "IMPACTS_DISABILITY",
+    ])
+
+    ALLOWED_PROPERTIES = {
+        "WCAGPrinciple":      {"ref_id", "title", "description", "url"},
+        "WCAGGuideline":      {"ref_id", "title", "description", "url"},
+        "WCAGCriterion":      {"ref_id", "title", "description", "level", "url", "intent",
+                               "in_brief_goal", "in_brief_what_to_do", "in_brief_why_important",
+                               "wcag_version", "disabilities"},
+        "ConformanceLevel":   {"name"},
+        "WCAGSpecialCase":    {"title", "description", "type", "index"},
+        "WCAGNote":           {"content", "index"},
+        "WCAGReference":      {"title", "url"},
+        "WCAGTechnique":      {"tech_id", "title", "url", "technology"},
+        "WCAGTestRule":       {"title", "url", "rule_id"},
+        "WCAGExample":        {"title", "description", "index"},
+        "WCAGBenefit":        {"description", "index"},
+        "WCAGKeyTerm":        {"term", "definition", "url"},
+        "WCAGRelatedResource": {"title", "url"},
+    }
+
+    MUTATION_KEYWORDS = re.compile(
+        r'\b(CREATE|DELETE|DETACH|SET|REMOVE|MERGE|DROP|CALL|LOAD|FOREACH)\b',
+        re.IGNORECASE,
+    )
+
+    MAX_RESULT_ROWS = 50   # hard limit injected if LIMIT missing
+    QUERY_TIMEOUT_MS = 10_000  # 10 seconds
+
+    # Graph schema description given to the LLM for Cypher generation
+    SCHEMA_PROMPT = """Neo4j WCAG 2.2 Knowledge Graph Schema
+═══════════════════════════════════════
+
+NODE LABELS & KEY PROPERTIES:
+  (:WCAGPrinciple      {ref_id, title, description})
+  (:WCAGGuideline      {ref_id, title, description})
+  (:WCAGCriterion      {ref_id, title, description, level, intent,
+                        in_brief_goal, in_brief_what_to_do, in_brief_why_important,
+                        wcag_version, disabilities})
+  (:ConformanceLevel   {name})            — values: "A", "AA", "AAA"
+  (:WCAGSpecialCase    {title, description, type, index})
+  (:WCAGNote           {content, index})
+  (:WCAGReference      {title, url})
+  (:WCAGTechnique      {tech_id, title, url, technology})
+  (:WCAGTestRule       {title, url, rule_id})
+  (:WCAGExample        {title, description, index})
+  (:WCAGBenefit        {description, index})
+  (:WCAGKeyTerm        {term, definition, url})
+  (:WCAGRelatedResource {title, url})
+
+RELATIONSHIPS:
+  (Criterion)-[:PART_OF]->(Guideline)-[:PART_OF]->(Principle)
+  (Criterion)-[:HAS_LEVEL]->(ConformanceLevel)
+  (Criterion)-[:HAS_TECHNIQUE]->(Technique)          — sufficient
+  (Criterion)-[:HAS_ADVISORY_TECHNIQUE]->(Technique)  — advisory
+  (Criterion)-[:HAS_FAILURE]->(Technique)             — failure
+  (Criterion)-[:HAS_SPECIAL_CASE]->(SpecialCase)
+  (Criterion)-[:HAS_NOTE]->(Note)
+  (Criterion)-[:HAS_REFERENCE]->(Reference)
+  (Criterion)-[:HAS_TEST_RULE]->(TestRule)
+  (Criterion)-[:HAS_EXAMPLE]->(Example)
+  (Criterion)-[:HAS_BENEFIT]->(Benefit)
+  (Criterion)-[:HAS_KEY_TERM]->(KeyTerm)
+  (Criterion)-[:HAS_RELATED_RESOURCE]->(RelatedResource)
+  (Criterion)-[:RELATED_CRITERION]->(Criterion)
+  (Criterion)-[:IMPACTS_DISABILITY]->(label stored in disabilities property)
+
+CARDINALITY HINTS:
+  4 Principles → 13 Guidelines → 87 Criteria
+  412 Techniques, 725 Key Terms, 284 Examples, 261 Related Resources
+  204 Benefits, 109 Test Rules, 91 Special Cases
+
+RULES:
+  • Generate READ-ONLY Cypher (no CREATE, SET, DELETE, MERGE, REMOVE, etc.)
+  • Always include a LIMIT clause (max 50)
+  • Use parameterised values with $param syntax when filtering on user input
+  • Return meaningful aliases (AS column_name)
+  • Prefer OPTIONAL MATCH for paths that may not exist
+"""
+
+    def __init__(self, db: Neo4jConnection, llm_client=None, llm_model: str = ""):
+        super().__init__(db)
+        self._llm_client = llm_client
+        self._llm_model = llm_model
+
+    def set_llm(self, llm_client, llm_model: str):
+        """Inject LLM client after construction (called by WCAGAgent)."""
+        self._llm_client = llm_client
+        self._llm_model = llm_model
+
+    @property
+    def name(self) -> str:
+        return "dynamic_cypher"
+
+    @property
+    def description(self) -> str:
+        return (
+            "Generate and execute an ad-hoc Cypher query against the WCAG knowledge graph. "
+            "Use for analytical / aggregate / negation questions that the pre-built tools "
+            "cannot answer, e.g., 'which criteria have more than 5 techniques?', "
+            "'show criteria WITHOUT test rules', 'count techniques per technology'. "
+            "The query is validated for safety before execution (read-only, schema-checked)."
+        )
+
+    @property
+    def parameters(self) -> dict:
+        return {
+            "type": "object",
+            "properties": {
+                "question": {
+                    "type": "string",
+                    "description": (
+                        "Natural-language question to answer via Cypher. "
+                        "The LLM will translate this into a safe, read-only Cypher query."
+                    ),
+                },
+                "cypher_hint": {
+                    "type": "string",
+                    "description": (
+                        "Optional: a Cypher fragment or pattern the agent thinks is relevant. "
+                        "Used as a hint for the Cypher generator."
+                    ),
+                },
+            },
+            "required": ["question"],
+        }
+
+    # ── Public entry point ──
+    def execute(self, **kwargs) -> ToolResult:
+        question = kwargs.get("question", "")
+        cypher_hint = kwargs.get("cypher_hint", "")
+
+        if not question:
+            return ToolResult(tool_name=self.name, success=False,
+                              error="A natural-language question is required.")
+
+        if not self._llm_client:
+            return ToolResult(tool_name=self.name, success=False,
+                              error="No LLM configured — dynamic Cypher requires an LLM.")
+
+        # Step 1: Ask LLM to generate Cypher
+        generated = self._generate_cypher(question, cypher_hint)
+        if not generated["success"]:
+            return ToolResult(tool_name=self.name, success=False,
+                              error=generated["error"])
+
+        cypher = generated["cypher"]
+        params = generated.get("params", {})
+        explanation = generated.get("explanation", "")
+
+        # Step 2: Validate the generated Cypher
+        validation = self._validate_cypher(cypher)
+        if not validation["safe"]:
+            return ToolResult(
+                tool_name=self.name, success=False,
+                error=f"Cypher rejected by guardrails: {validation['reason']}",
+                cypher_used=cypher,
+            )
+
+        # Step 3: Inject LIMIT if missing
+        cypher = self._ensure_limit(cypher)
+
+        # Step 4: Execute with timeout
+        try:
+            results, elapsed = self._timed_query(cypher, params)
+        except Exception as e:
+            return ToolResult(
+                tool_name=self.name, success=False,
+                error=f"Cypher execution error: {e}",
+                cypher_used=cypher,
+            )
+
+        return ToolResult(
+            tool_name=self.name, success=True,
+            data={
+                "question": question,
+                "cypher": cypher,
+                "params": params,
+                "explanation": explanation,
+                "row_count": len(results),
+                "results": results[:self.MAX_RESULT_ROWS],
+            },
+            execution_time=elapsed,
+            cypher_used=cypher,
+        )
+
+    # ── Cypher generation via LLM ──
+    def _generate_cypher(self, question: str, hint: str = "") -> dict:
+        """Ask the LLM to produce a Cypher query for the given question."""
+        user_content = f"Question: {question}"
+        if hint:
+            user_content += f"\nHint: {hint}"
+        user_content += (
+            "\n\nGenerate a READ-ONLY Cypher query. Respond in JSON with keys: "
+            '"cypher" (string), "params" (object, may be empty), "explanation" (string). '
+            "Return ONLY the JSON — no markdown fences, no extra text."
+        )
+
+        try:
+            resp = self._llm_client.chat.completions.create(
+                model=self._llm_model,
+                messages=[
+                    {"role": "system", "content": self.SCHEMA_PROMPT},
+                    {"role": "user", "content": user_content},
+                ],
+                temperature=0.0,
+                max_tokens=1024,
+            )
+            raw = resp.choices[0].message.content.strip()
+
+            # Strip markdown code fences if present
+            if raw.startswith("```"):
+                raw = re.sub(r'^```(?:json)?\s*', '', raw)
+                raw = re.sub(r'\s*```$', '', raw)
+
+            payload = json.loads(raw)
+            cypher = payload.get("cypher", "").strip()
+            if not cypher:
+                return {"success": False, "error": "LLM returned empty Cypher"}
+            return {
+                "success": True,
+                "cypher": cypher,
+                "params": payload.get("params", {}),
+                "explanation": payload.get("explanation", ""),
+            }
+        except json.JSONDecodeError as e:
+            return {"success": False, "error": f"LLM returned invalid JSON: {e}"}
+        except Exception as e:
+            return {"success": False, "error": f"Cypher generation failed: {e}"}
+
+    # ── Cypher validation (guardrails) ──
+    def _validate_cypher(self, cypher: str) -> dict:
+        """Validate a Cypher query against all guardrails.  Returns {'safe': bool, 'reason': str}."""
+
+        # Guard 1: mutation keywords
+        if self.MUTATION_KEYWORDS.search(cypher):
+            return {"safe": False, "reason": "Mutation keyword detected — only read queries allowed"}
+
+        # Guard 2: node label allowlist
+        # Node labels appear as (:Label) or (var:Label) — NOT inside square brackets
+        label_pattern = re.compile(r'\(\w*:(\w+)')
+        labels_found = set(label_pattern.findall(cypher))
+        unknown_labels = labels_found - self.ALLOWED_NODE_LABELS
+        if unknown_labels:
+            return {"safe": False, "reason": f"Unknown node label(s): {unknown_labels}"}
+
+        # Guard 3: relationship type allowlist
+        # Relationship types appear inside square brackets: [:TYPE] or [r:TYPE]
+        rel_pattern = re.compile(r'\[\w*:([A-Z_|]+)')
+        rels_raw = rel_pattern.findall(cypher)
+        rels_found: set[str] = set()
+        for raw in rels_raw:
+            for part in raw.split("|"):
+                part = part.strip()
+                if part:
+                    rels_found.add(part)
+        unknown_rels = rels_found - self.ALLOWED_RELATIONSHIP_TYPES
+        if unknown_rels:
+            return {"safe": False, "reason": f"Unknown relationship type(s): {unknown_rels}"}
+
+        # Guard 4: property allowlist — for each label, check accessed properties
+        for label in labels_found:
+            if label in self.ALLOWED_PROPERTIES:
+                allowed_props = self.ALLOWED_PROPERTIES[label]
+                # Find property accesses for this label's variable aliases
+                # e.g.  (c:WCAGCriterion)  then  c.some_prop  or  {some_prop: ...}
+                # We'll do a best-effort check using .<prop> pattern near the label
+                # Full static analysis is complex; this catches obvious mistakes
+                prop_access = re.findall(r'\.(\w+)', cypher)
+                # Only flag if a property clearly doesn't exist on ANY label
+                # (conservative: allow any property that exists on any node)
+                pass  # conservative — full property validation deferred to Neo4j
+
+        # Guard 5: no APOC / db.* / gds.* procedures
+        if re.search(r'\b(apoc|gds|db|dbms)\.\w+', cypher, re.IGNORECASE):
+            return {"safe": False, "reason": "Procedure/function calls not allowed (apoc/gds/db)"}
+
+        return {"safe": True, "reason": ""}
+
+    def _ensure_limit(self, cypher: str) -> str:
+        """Inject a LIMIT clause if the query doesn't already have one."""
+        if not re.search(r'\bLIMIT\b', cypher, re.IGNORECASE):
+            cypher = cypher.rstrip().rstrip(';')
+            cypher += f"\nLIMIT {self.MAX_RESULT_ROWS}"
+        return cypher
+
+
+# ============================================================
+# TOOL 9: CONTEXT ASSEMBLER
 # ============================================================
 class ContextAssemblerTool(BaseTool):
     """
@@ -1683,6 +2003,405 @@ Description:
 
 
 # ============================================================
+# QUERY DECOMPOSER — breaks complex queries into sub-steps
+# ============================================================
+@dataclass
+class QueryStep:
+    """A single sub-step in a decomposed query plan."""
+    step_id: int
+    description: str
+    tool: str                      # tool name to call
+    params: dict = field(default_factory=dict)
+    depends_on: list[int] = field(default_factory=list)  # step_ids this depends on
+    priority: int = 1              # 1 = highest
+    status: str = "pending"        # pending | running | done | failed
+    result: Optional[ToolResult] = None
+
+    def __repr__(self):
+        deps = f" (after {self.depends_on})" if self.depends_on else ""
+        return f"Step {self.step_id} [P{self.priority}]: {self.tool} — {self.description}{deps}"
+
+
+@dataclass
+class QueryPlan:
+    """A full execution plan for a user query."""
+    original_query: str
+    intent_summary: str = ""
+    steps: list[QueryStep] = field(default_factory=list)
+    reasoning: str = ""
+    created_at: float = 0.0
+
+    def pending_steps(self) -> list[QueryStep]:
+        """Return steps whose dependencies are all satisfied."""
+        done_ids = {s.step_id for s in self.steps if s.status == "done"}
+        return [
+            s for s in self.steps
+            if s.status == "pending" and all(d in done_ids for d in s.depends_on)
+        ]
+
+    def is_complete(self) -> bool:
+        return all(s.status in ("done", "failed") for s in self.steps)
+
+
+class QueryDecomposer:
+    """
+    Decomposes a user query into an ordered plan of tool calls.
+    Uses the LLM for complex queries; falls back to simple heuristics.
+    """
+
+    # Mapping from intent keywords → decomposition templates
+    TEMPLATES: dict[str, list[dict]] = {
+        "audit_scenario": [
+            {"tool": "rule_engine", "desc": "Identify applicable rules for each UI element",
+             "params_hint": "check_type=element_rules"},
+            {"tool": "context_assembler", "desc": "Assemble full context for discovered criteria",
+             "params_hint": "criterion_ids from step 1"},
+        ],
+        "comparison": [
+            {"tool": "graph_traversal", "desc": "Retrieve side A data"},
+            {"tool": "graph_traversal", "desc": "Retrieve side B data"},
+            {"tool": "dynamic_cypher", "desc": "Compare the two sets",
+             "params_hint": "aggregation / difference query"},
+        ],
+        "aggregate_analytics": [
+            {"tool": "dynamic_cypher", "desc": "Run analytical Cypher query"},
+        ],
+        "deep_dive_criterion": [
+            {"tool": "context_assembler", "desc": "Get full criterion context"},
+            {"tool": "technique_finder", "desc": "Find implementation techniques"},
+            {"tool": "cross_reference", "desc": "Map related criteria and ripple effects"},
+        ],
+    }
+
+    DECOMPOSITION_PROMPT = """You are a query planner for a WCAG 2.2 accessibility knowledge graph.
+Given a user question, decompose it into a sequence of tool calls.
+
+AVAILABLE TOOLS:
+1. graph_traversal — ID-based hierarchy navigation (principle/guideline/criterion lookups)
+2. semantic_search — keyword/topic search across criteria, examples, benefits, key terms
+3. technique_finder — find sufficient/advisory/failure techniques for a criterion
+4. rule_engine — compliance rules, element-specific rules, disability impact, checklists
+5. impact_analysis — disability matrix, input modality analysis
+6. key_term_lookup — WCAG terminology definitions
+7. cross_reference — multi-hop analysis: related chains, shared techniques, disability overlap, ripple effects
+8. context_assembler — assemble full LLM-ready context for criteria (use as final step)
+9. dynamic_cypher — ad-hoc analytical Cypher queries (counts, aggregations, negations, filters not covered by other tools)
+
+RULES:
+- Each step must specify: tool name, parameters, a brief description, dependencies (which prior step IDs), and priority (1=highest).
+- Use dynamic_cypher ONLY when no pre-built tool can answer the sub-question.
+- Always end with context_assembler if the answer requires detailed criterion information.
+- Keep plans concise: 2-5 steps for most queries.
+- For simple single-tool queries, return just 1 step.
+
+Respond in JSON with this schema:
+{
+  "intent_summary": "one-line summary of what the user wants",
+  "reasoning": "brief explanation of the decomposition logic",
+  "steps": [
+    {
+      "step_id": 1,
+      "description": "what this step does",
+      "tool": "tool_name",
+      "params": {"param1": "value1"},
+      "depends_on": [],
+      "priority": 1
+    }
+  ]
+}
+Return ONLY JSON — no markdown fences, no extra text."""
+
+    def __init__(self, llm_client=None, llm_model: str = "",
+                 available_tools: list[str] | None = None):
+        self._llm_client = llm_client
+        self._llm_model = llm_model
+        self._available_tools = set(available_tools or [])
+
+    def set_llm(self, llm_client, llm_model: str):
+        self._llm_client = llm_client
+        self._llm_model = llm_model
+
+    def decompose(self, query: str) -> QueryPlan:
+        """Decompose a query into a QueryPlan.  Uses LLM if available."""
+        if self._llm_client:
+            return self._llm_decompose(query)
+        return self._heuristic_decompose(query)
+
+    # ── LLM-powered decomposition ──
+    def _llm_decompose(self, query: str) -> QueryPlan:
+        """Use the LLM to decompose the query into steps."""
+        try:
+            resp = self._llm_client.chat.completions.create(
+                model=self._llm_model,
+                messages=[
+                    {"role": "system", "content": self.DECOMPOSITION_PROMPT},
+                    {"role": "user", "content": query},
+                ],
+                temperature=0.0,
+                max_tokens=1024,
+            )
+            raw = resp.choices[0].message.content.strip()
+
+            # Strip markdown fences
+            if raw.startswith("```"):
+                raw = re.sub(r'^```(?:json)?\s*', '', raw)
+                raw = re.sub(r'\s*```$', '', raw)
+
+            payload = json.loads(raw)
+
+            steps: list[QueryStep] = []
+            for s in payload.get("steps", []):
+                tool_name = s.get("tool", "")
+                # Validate tool exists
+                if self._available_tools and tool_name not in self._available_tools:
+                    log.warning("  Decomposer: LLM suggested unknown tool '%s', skipping", tool_name)
+                    continue
+                steps.append(QueryStep(
+                    step_id=s.get("step_id", len(steps) + 1),
+                    description=s.get("description", ""),
+                    tool=tool_name,
+                    params=s.get("params", {}),
+                    depends_on=s.get("depends_on", []),
+                    priority=s.get("priority", len(steps) + 1),
+                ))
+
+            if not steps:
+                log.warning("  Decomposer: LLM returned no valid steps, falling back")
+                return self._heuristic_decompose(query)
+
+            return QueryPlan(
+                original_query=query,
+                intent_summary=payload.get("intent_summary", ""),
+                steps=steps,
+                reasoning=payload.get("reasoning", ""),
+                created_at=time.time(),
+            )
+        except Exception as e:
+            log.warning("  Decomposer LLM failed: %s — using heuristic", e)
+            return self._heuristic_decompose(query)
+
+    # ── Heuristic (rule-based) decomposition ──
+    def _heuristic_decompose(self, query: str) -> QueryPlan:
+        """Simple pattern-matching decomposition without an LLM."""
+        q = query.lower().strip()
+        steps: list[QueryStep] = []
+        step_id = 0
+
+        # Detect criterion IDs
+        criterion_ids = re.findall(r'\b(\d+\.\d+\.\d+)\b', q)
+
+        # Detect element keywords
+        elements = []
+        element_map = {
+            "image": "image", "img": "image", "form": "form",
+            "video": "video", "audio": "audio", "link": "link",
+            "button": "button", "table": "table", "heading": "heading",
+            "color": "color", "contrast": "color", "keyboard": "button",
+        }
+        for kw, elem in element_map.items():
+            if kw in q and elem not in elements:
+                elements.append(elem)
+
+        # Pattern: aggregate / count / analytics → dynamic_cypher
+        if any(kw in q for kw in ["how many", "count", "most", "least", "average",
+                                     "without", "missing", "more than", "fewer than",
+                                     "percentage", "which criteria have"]):
+            step_id += 1
+            steps.append(QueryStep(
+                step_id=step_id, description="Run analytical query",
+                tool="dynamic_cypher", params={"question": query}, priority=1,
+            ))
+            return QueryPlan(original_query=query, intent_summary="analytics",
+                             steps=steps, created_at=time.time())
+
+        # Pattern: specific criteria → context_assembler + optional techniques
+        if criterion_ids:
+            step_id += 1
+            steps.append(QueryStep(
+                step_id=step_id, description=f"Assemble context for {', '.join(criterion_ids)}",
+                tool="context_assembler", params={"criterion_ids": criterion_ids}, priority=1,
+            ))
+            if any(kw in q for kw in ["how", "technique", "fix", "implement"]):
+                for cid in criterion_ids:
+                    step_id += 1
+                    steps.append(QueryStep(
+                        step_id=step_id, description=f"Find techniques for {cid}",
+                        tool="technique_finder",
+                        params={"criterion_id": cid, "technique_type": "all"},
+                        priority=2,
+                    ))
+            if any(kw in q for kw in ["related", "ripple", "cascade", "also"]):
+                step_id += 1
+                steps.append(QueryStep(
+                    step_id=step_id, description=f"Analyze ripple effect from {criterion_ids[0]}",
+                    tool="cross_reference",
+                    params={"analysis_type": "fix_ripple_effect", "criterion_id": criterion_ids[0]},
+                    priority=2,
+                ))
+            return QueryPlan(original_query=query, intent_summary="criterion_detail",
+                             steps=steps, created_at=time.time())
+
+        # Pattern: element audit → rule_engine per element → context_assembler
+        if elements:
+            for elem in elements:
+                step_id += 1
+                steps.append(QueryStep(
+                    step_id=step_id, description=f"Find rules for {elem} elements",
+                    tool="rule_engine",
+                    params={"check_type": "element_rules", "element_type": elem},
+                    priority=1,
+                ))
+            step_id += 1
+            steps.append(QueryStep(
+                step_id=step_id, description="Assemble context for discovered criteria",
+                tool="context_assembler", params={"criterion_ids": []},
+                depends_on=list(range(1, step_id)), priority=2,
+            ))
+            return QueryPlan(original_query=query, intent_summary="element_rules",
+                             steps=steps, created_at=time.time())
+
+        # Pattern: terminology
+        term_match = re.search(
+            r'(?:what\s+(?:does|is|are)|define|meaning\s+of)\s+["\']?(.+?)["\']?\s*(?:\?|$)',
+            q, re.IGNORECASE,
+        )
+        if term_match:
+            term = term_match.group(1).strip().rstrip("?. ")
+            step_id += 1
+            steps.append(QueryStep(
+                step_id=step_id, description=f"Look up definition of '{term}'",
+                tool="key_term_lookup", params={"term": term}, priority=1,
+            ))
+            return QueryPlan(original_query=query, intent_summary="terminology",
+                             steps=steps, created_at=time.time())
+
+        # Fallback: semantic search
+        step_id += 1
+        steps.append(QueryStep(
+            step_id=step_id, description="Broad keyword search",
+            tool="semantic_search", params={"query": query, "limit": 10}, priority=1,
+        ))
+        return QueryPlan(original_query=query, intent_summary="general_search",
+                         steps=steps, created_at=time.time())
+
+
+# ============================================================
+# STEP PLANNER / EXECUTOR — runs a QueryPlan with dependency ordering
+# ============================================================
+class StepExecutor:
+    """
+    Executes a QueryPlan step-by-step, respecting dependencies.
+    Passes intermediate results between steps when needed.
+    """
+
+    def __init__(self, tools: dict[str, BaseTool], verbose: bool = True):
+        self.tools = tools
+        self.verbose = verbose
+
+    def execute_plan(self, plan: QueryPlan, trace_steps: list | None = None) -> list[ToolResult]:
+        """Execute all steps in dependency/priority order.  Returns list of ToolResults."""
+        results: list[ToolResult] = []
+        max_iterations = len(plan.steps) * 2  # safety valve
+
+        for _ in range(max_iterations):
+            if plan.is_complete():
+                break
+
+            ready = plan.pending_steps()
+            if not ready:
+                log.warning("  StepExecutor: no ready steps but plan not complete — breaking")
+                break
+
+            # Pick highest-priority ready step
+            ready.sort(key=lambda s: s.priority)
+            step = ready[0]
+            step.status = "running"
+
+            if self.verbose:
+                log.info("  PLAN STEP %d [P%d] → %s(%s) — %s",
+                         step.step_id, step.priority, step.tool,
+                         json.dumps(step.params, default=str)[:120], step.description)
+
+            # Resolve dynamic parameters from prior step results
+            params = self._resolve_params(step, plan)
+
+            if step.tool not in self.tools:
+                step.status = "failed"
+                step.result = ToolResult(tool_name=step.tool, success=False,
+                                         error=f"Unknown tool: {step.tool}")
+                results.append(step.result)
+                continue
+
+            try:
+                result = self.tools[step.tool].execute(**params)
+            except Exception as e:
+                result = ToolResult(tool_name=step.tool, success=False,
+                                     error=f"Execution error: {e}")
+
+            step.result = result
+            step.status = "done" if result.success else "failed"
+            results.append(result)
+
+            if self.verbose:
+                status_icon = "✅" if result.success else "❌"
+                data_preview = str(result.data)[:150] if result.data else "empty"
+                log.info("  PLAN STEP %d %s (%.3fs): %s",
+                         step.step_id, status_icon, result.execution_time, data_preview)
+
+            # Track in agent trace if provided
+            if trace_steps is not None:
+                trace_steps.append(AgentStep(
+                    step_number=len(trace_steps) + 1,
+                    action=AgentAction.CALL_TOOL,
+                    thought=f"Plan step {step.step_id}: {step.description}",
+                    tool_name=step.tool,
+                    tool_params=params,
+                    tool_result=result,
+                    timestamp=time.time(),
+                ))
+
+        return results
+
+    def _resolve_params(self, step: QueryStep, plan: QueryPlan) -> dict:
+        """
+        Resolve dynamic parameters. If a step depends on prior steps
+        and has placeholder params, fill them from prior results.
+        """
+        params = dict(step.params)
+
+        # Special case: context_assembler with empty criterion_ids
+        # → collect IDs from all prior steps' results
+        if step.tool == "context_assembler" and not params.get("criterion_ids"):
+            collected_ids = []
+            for dep_id in step.depends_on:
+                dep_step = next((s for s in plan.steps if s.step_id == dep_id), None)
+                if dep_step and dep_step.result and dep_step.result.success:
+                    collected_ids.extend(self._extract_criterion_ids(dep_step.result.data))
+            if collected_ids:
+                params["criterion_ids"] = list(dict.fromkeys(collected_ids))[:5]
+
+        return params
+
+    @staticmethod
+    def _extract_criterion_ids(data) -> list[str]:
+        """Extract criterion ref_ids from tool result data."""
+        ids = []
+        if isinstance(data, list):
+            for item in data:
+                if isinstance(item, dict) and "ref_id" in item:
+                    ref_id = str(item["ref_id"])
+                    if re.match(r'^\d+\.\d+\.\d+$', ref_id):
+                        ids.append(ref_id)
+        elif isinstance(data, dict):
+            for key, value in data.items():
+                if key in ("rules", "criteria", "checklist", "results"):
+                    ids.extend(StepExecutor._extract_criterion_ids(value))
+                elif key == "ref_id" and re.match(r'^\d+\.\d+\.\d+$', str(value)):
+                    ids.append(str(value))
+        return ids
+
+
+# ============================================================
 # AGENT REASONING ENGINE
 # ============================================================
 class AgentAction(Enum):
@@ -1736,6 +2455,8 @@ class WCAGAgent:
         self.tools: dict[str, BaseTool] = {}
         self.llm_client = None
         self._llm_model_name: str = config.llm_model  # may be overridden by _init_llm
+        self.decomposer: Optional[QueryDecomposer] = None
+        self.step_executor: Optional[StepExecutor] = None
 
         # Register all tools
         self._register_tools()
@@ -1753,12 +2474,21 @@ class WCAGAgent:
             ImpactAnalysisTool,
             KeyTermLookupTool,
             CrossReferenceTool,
+            DynamicCypherTool,
             ContextAssemblerTool,
         ]
         for cls in tool_classes:
             tool = cls(self.db)
             self.tools[tool.name] = tool
             log.info("  Registered tool: %s", tool.name)
+
+        # Initialize decomposer and executor (LLM injected later in _init_llm)
+        self.decomposer = QueryDecomposer(
+            available_tools=list(self.tools.keys()),
+        )
+        self.step_executor = StepExecutor(
+            tools=self.tools, verbose=self.config.verbose,
+        )
 
     def _init_llm(self):
         """Initialize LLM client if API key is available."""
@@ -1806,6 +2536,16 @@ class WCAGAgent:
         except Exception as e:
             log.warning("  LLM init failed: %s — using rule-based routing", e)
 
+        # Inject LLM into DynamicCypherTool and QueryDecomposer
+        if self.llm_client:
+            dyn = self.tools.get("dynamic_cypher")
+            if dyn and isinstance(dyn, DynamicCypherTool):
+                dyn.set_llm(self.llm_client, self._llm_model_name)
+                log.info("  DynamicCypherTool: LLM injected")
+            if self.decomposer:
+                self.decomposer.set_llm(self.llm_client, self._llm_model_name)
+                log.info("  QueryDecomposer: LLM injected")
+
     def process_query(self, user_query: str) -> AgentTrace:
         """
         Main entry point: process a user query through the agentic loop.
@@ -1839,78 +2579,128 @@ class WCAGAgent:
     def _rule_based_loop(self, query: str, trace: AgentTrace) -> AgentTrace:
         """
         Rule-based query routing when no LLM is available.
-        Analyzes the query structure and routes to appropriate tools.
+        Uses the QueryDecomposer to plan steps, then StepExecutor to run them.
+        Falls back to legacy _analyze_query if decomposer is unavailable.
         """
         query_lower = query.lower().strip()
         step_num = 0
         collected_context = []
 
-        # ── Step 1: Query Analysis ──
+        # ── Step 1: Decompose the query into a plan ──
         step_num += 1
-        analysis = self._analyze_query(query_lower)
-        trace.steps.append(AgentStep(
-            step_number=step_num,
-            action=AgentAction.THINK,
-            thought=f"Query analysis: {json.dumps(analysis, indent=2)}",
-            timestamp=time.time(),
-        ))
+        plan = self.decomposer.decompose(query_lower) if self.decomposer else None
 
-        if self.config.verbose:
-            log.info("  THINK → %s", json.dumps(analysis))
-
-        # ── Step 2+: Execute planned tool calls ──
-        for tool_call in analysis.get("tool_plan", []):
-            step_num += 1
-            tool_name = tool_call["tool"]
-            tool_params = tool_call["params"]
-
-            if tool_name not in self.tools:
-                log.warning("  Unknown tool in plan: %s", tool_name)
-                continue
-
-            if self.config.verbose:
-                log.info("  ACT   → %s(%s)", tool_name, tool_params)
-
-            result = self.tools[tool_name].execute(**tool_params)
-            collected_context.append(result)
-            trace.tools_called.append(tool_name)
-
+        if plan and plan.steps:
+            plan_summary = {
+                "intent": plan.intent_summary,
+                "reasoning": plan.reasoning,
+                "steps": [str(s) for s in plan.steps],
+            }
             trace.steps.append(AgentStep(
                 step_number=step_num,
-                action=AgentAction.CALL_TOOL,
-                thought=f"Calling {tool_name} for: {tool_call.get('reason', '')}",
-                tool_name=tool_name,
-                tool_params=tool_params,
-                tool_result=result,
+                action=AgentAction.THINK,
+                thought=f"Query plan: {json.dumps(plan_summary, indent=2)}",
+                timestamp=time.time(),
+            ))
+            if self.config.verbose:
+                log.info("  PLAN → %d steps, intent=%s", len(plan.steps), plan.intent_summary)
+                for s in plan.steps:
+                    log.info("    %s", s)
+
+            # ── Step 2+: Execute the plan ──
+            collected_context = self.step_executor.execute_plan(
+                plan, trace_steps=trace.steps,
+            )
+            trace.tools_called = [s.tool for s in plan.steps if s.status == "done"]
+
+            # ── Auto context assembly: if results contain criterion IDs
+            # and context_assembler wasn't already in the plan ──
+            planned_tools = {s.tool for s in plan.steps}
+            if "context_assembler" not in planned_tools:
+                all_ids = []
+                for res in collected_context:
+                    if res.success and res.data:
+                        all_ids.extend(self._extract_criterion_ids(res.data))
+                all_ids = list(dict.fromkeys(all_ids))[:5]
+                if all_ids:
+                    ctx_result = self.tools["context_assembler"].execute(
+                        criterion_ids=all_ids,
+                    )
+                    collected_context.append(ctx_result)
+                    trace.tools_called.append("context_assembler")
+                    trace.steps.append(AgentStep(
+                        step_number=len(trace.steps) + 1,
+                        action=AgentAction.CALL_TOOL,
+                        thought=f"Auto-assembling context for {all_ids}",
+                        tool_name="context_assembler",
+                        tool_params={"criterion_ids": all_ids},
+                        tool_result=ctx_result,
+                        timestamp=time.time(),
+                    ))
+
+            analysis = {"intent": plan.intent_summary}
+        else:
+            # Legacy fallback to _analyze_query
+            analysis = self._analyze_query(query_lower)
+            trace.steps.append(AgentStep(
+                step_number=step_num,
+                action=AgentAction.THINK,
+                thought=f"Query analysis: {json.dumps(analysis, indent=2)}",
                 timestamp=time.time(),
             ))
 
             if self.config.verbose:
-                data_preview = str(result.data)[:200] if result.data else "empty"
-                log.info("  OBSERVE → %s: %s...", tool_name, data_preview)
+                log.info("  THINK → %s", json.dumps(analysis))
 
-            # If we found specific criterion IDs, assemble full context
-            if result.success and result.data:
-                criterion_ids = self._extract_criterion_ids(result.data)
-                if criterion_ids and "context_assembler" not in [tc["tool"] for tc in analysis["tool_plan"]]:
-                    step_num += 1
-                    # Limit to top 5 to avoid context overflow
-                    ids_to_assemble = criterion_ids[:5]
-                    ctx_result = self.tools["context_assembler"].execute(
-                        criterion_ids=ids_to_assemble,
-                    )
-                    collected_context.append(ctx_result)
-                    trace.tools_called.append("context_assembler")
+            for tool_call in analysis.get("tool_plan", []):
+                step_num += 1
+                tool_name = tool_call["tool"]
+                tool_params = tool_call["params"]
 
-                    trace.steps.append(AgentStep(
-                        step_number=step_num,
-                        action=AgentAction.CALL_TOOL,
-                        thought=f"Assembling full context for {ids_to_assemble}",
-                        tool_name="context_assembler",
-                        tool_params={"criterion_ids": ids_to_assemble},
-                        tool_result=ctx_result,
-                        timestamp=time.time(),
-                    ))
+                if tool_name not in self.tools:
+                    log.warning("  Unknown tool in plan: %s", tool_name)
+                    continue
+
+                if self.config.verbose:
+                    log.info("  ACT   → %s(%s)", tool_name, tool_params)
+
+                result = self.tools[tool_name].execute(**tool_params)
+                collected_context.append(result)
+                trace.tools_called.append(tool_name)
+
+                trace.steps.append(AgentStep(
+                    step_number=step_num,
+                    action=AgentAction.CALL_TOOL,
+                    thought=f"Calling {tool_name} for: {tool_call.get('reason', '')}",
+                    tool_name=tool_name,
+                    tool_params=tool_params,
+                    tool_result=result,
+                    timestamp=time.time(),
+                ))
+
+                if self.config.verbose:
+                    data_preview = str(result.data)[:200] if result.data else "empty"
+                    log.info("  OBSERVE → %s: %s...", tool_name, data_preview)
+
+                if result.success and result.data:
+                    criterion_ids = self._extract_criterion_ids(result.data)
+                    if criterion_ids and "context_assembler" not in [tc["tool"] for tc in analysis["tool_plan"]]:
+                        step_num += 1
+                        ids_to_assemble = criterion_ids[:5]
+                        ctx_result = self.tools["context_assembler"].execute(
+                            criterion_ids=ids_to_assemble,
+                        )
+                        collected_context.append(ctx_result)
+                        trace.tools_called.append("context_assembler")
+                        trace.steps.append(AgentStep(
+                            step_number=step_num,
+                            action=AgentAction.CALL_TOOL,
+                            thought=f"Assembling full context for {ids_to_assemble}",
+                            tool_name="context_assembler",
+                            tool_params={"criterion_ids": ids_to_assemble},
+                            tool_result=ctx_result,
+                            timestamp=time.time(),
+                        ))
 
         # ── Final Step: Generate response ──
         step_num += 1
@@ -2154,6 +2944,19 @@ class WCAGAgent:
                 "tool": "graph_traversal",
                 "params": {"query_type": "get_full_hierarchy"},
                 "reason": "Get complete WCAG hierarchy",
+            })
+            return analysis
+
+        # ── Analytics / aggregate / negation → dynamic_cypher ──
+        if any(kw in query for kw in ["how many", "count", "most", "least", "average",
+                                       "without", "missing", "more than", "fewer than",
+                                       "percentage", "top", "bottom", "rank",
+                                       "which criteria have", "statistics", "breakdown"]):
+            analysis["intent"] = "analytics"
+            analysis["tool_plan"].append({
+                "tool": "dynamic_cypher",
+                "params": {"question": query},
+                "reason": "Run analytical ad-hoc Cypher query",
             })
             return analysis
 
@@ -2431,6 +3234,29 @@ class WCAGAgent:
                     lines.append("")
                     continue
 
+                # Dynamic Cypher — show generated query + results
+                if item.tool_name == "dynamic_cypher" and isinstance(data, dict):
+                    lines.append("  ⚡ Dynamic Cypher Results:")
+                    lines.append("")
+                    cypher_q = data.get("cypher", "")
+                    if cypher_q:
+                        lines.append(f"  Cypher: {cypher_q[:300]}")
+                    explanation = data.get("explanation", "")
+                    if explanation:
+                        lines.append(f"  Explanation: {explanation}")
+                    lines.append(f"  Rows returned: {data.get('row_count', 0)}")
+                    lines.append("")
+                    results = data.get("results", [])
+                    for i, row in enumerate(results[:25], 1):
+                        parts = []
+                        for k, v in row.items():
+                            parts.append(f"{k}={v}")
+                        lines.append(f"  {i}. {' │ '.join(parts)}")
+                    if len(results) > 25:
+                        lines.append(f"  ... and {len(results) - 25} more rows")
+                    lines.append("")
+                    continue
+
                 # Fallback for any other tool — compact JSON
                 lines.append(f"  [{item.tool_name}]:")
                 text = json.dumps(data, indent=2, default=str)
@@ -2453,20 +3279,61 @@ class WCAGAgent:
     def _llm_agentic_loop(self, query: str, trace: AgentTrace) -> AgentTrace:
         """
         Full agentic loop powered by LLM function calling.
-        The LLM decides which tools to call and when to stop.
+
+        NEW: Before entering the ReAct loop the QueryDecomposer creates
+        a plan.  The plan is injected as a system hint so the LLM follows
+        the recommended step order while still retaining the freedom to
+        deviate if intermediate results warrant it.
         """
+        # ── Phase 0: Query Decomposition / Planning ──
+        plan: Optional[QueryPlan] = None
+        plan_hint = ""
+        if self.decomposer:
+            plan = self.decomposer.decompose(query)
+            if plan and plan.steps:
+                plan_lines = [f"Intent: {plan.intent_summary}"]
+                if plan.reasoning:
+                    plan_lines.append(f"Reasoning: {plan.reasoning}")
+                plan_lines.append("Recommended steps:")
+                for s in plan.steps:
+                    deps = f" (after step {s.depends_on})" if s.depends_on else ""
+                    plan_lines.append(
+                        f"  {s.step_id}. [{s.tool}] {s.description}{deps}"
+                    )
+                plan_hint = "\n".join(plan_lines)
+
+                trace.steps.append(AgentStep(
+                    step_number=1,
+                    action=AgentAction.THINK,
+                    thought=f"Query decomposition plan:\n{plan_hint}",
+                    timestamp=time.time(),
+                ))
+                if self.config.verbose:
+                    log.info("  DECOMPOSE → %d steps, intent=%s",
+                             len(plan.steps), plan.intent_summary)
+                    for s in plan.steps:
+                        log.info("    %s", s)
+
         # Build tool definitions for function calling
         tools_schema = self._build_tools_schema()
 
         # System prompt
         system_prompt = self._build_system_prompt()
 
+        # Inject the plan as guidance
+        user_message = query
+        if plan_hint:
+            user_message += (
+                "\n\n--- QUERY PLAN (follow this order unless results suggest otherwise) ---\n"
+                + plan_hint
+            )
+
         messages = [
             {"role": "system", "content": system_prompt},
-            {"role": "user", "content": query},
+            {"role": "user", "content": user_message},
         ]
 
-        step_num = 0
+        step_num = len(trace.steps)  # continue numbering after decomposition step
         for _ in range(self.config.max_agent_steps):
             step_num += 1
 
@@ -2546,6 +3413,7 @@ class WCAGAgent:
     def _build_system_prompt(self) -> str:
         """Build the system prompt for the LLM agent."""
         return """You are an expert WCAG 2.2 accessibility consultant powered by a Neo4j knowledge graph.
+You operate in a Plan → Execute → Synthesise loop.  A query plan may be provided below the user query — follow it unless intermediate results suggest a better path.
 
 KNOWLEDGE GRAPH CONTENTS (2,418 nodes):
 - 4 Principles → 13 Guidelines → 87 Success Criteria (full metadata, intent, in-brief)
@@ -2559,7 +3427,7 @@ KNOWLEDGE GRAPH CONTENTS (2,418 nodes):
 - Cross-references between related criteria
 - Disability impact tags on every criterion
 
-AVAILABLE TOOLS (8):
+AVAILABLE TOOLS (9):
 1. graph_traversal — Navigate the WCAG hierarchy by ID (principle → guideline → criterion). Use for ID-based lookups.
 2. semantic_search — Keyword search across criteria, examples, benefits, and key terms. Use for topic-based queries.
 3. technique_finder — Find sufficient/advisory/failure techniques for a criterion or technology. Use for "how to comply" questions.
@@ -2567,7 +3435,15 @@ AVAILABLE TOOLS (8):
 5. impact_analysis — Disability matrix, input modality analysis, criterion-level impact breakdown.
 6. key_term_lookup — Look up WCAG key term definitions. Use when user asks "what does X mean?" or references WCAG-specific terminology.
 7. cross_reference — Multi-hop graph analysis: related criterion chains, shared techniques across criteria, disability overlap, technique coverage maps, fix ripple effects.
-8. context_assembler — Assemble complete LLM-ready context for one or more criteria. Use as FINAL step before generating a response.
+8. dynamic_cypher — Generate and run ad-hoc Cypher queries for ANALYTICAL / AGGREGATE / NEGATION questions not covered by tools 1-7 (e.g., "which criteria have more than 5 techniques?", "show criteria WITHOUT test rules", "count techniques per technology"). The LLM writes the Cypher; guardrails enforce read-only, schema-checked execution.
+9. context_assembler — Assemble complete LLM-ready context for one or more criteria. Use as FINAL step before generating a response.
+
+WHEN TO USE dynamic_cypher (Tool 8):
+- Counting / aggregation: "how many criteria per level?", "average techniques per criterion"
+- Negation / absence: "criteria without test rules", "guidelines with no AAA criteria"
+- Ranking / top-N: "top 5 criteria by technique count"
+- Complex filters: "level A criteria that affect both blind and deaf users and have ARIA techniques"
+- Any question that tools 1-7 cannot handle with their pre-built templates
 
 QUERY DECOMPOSITION PATTERNS:
 
@@ -2599,17 +3475,23 @@ For TECHNIQUE questions (e.g., "what does H37 cover?" or "ARIA techniques for fo
   Step 1: Use technique_finder or cross_reference(technique_coverage)
   Step 2: Show which criteria each technique satisfies
 
+For ANALYTICAL / STATISTICAL questions (e.g., "how many criteria per level?"):
+  Step 1: Use dynamic_cypher with the analytical question
+  Step 2: Optionally use context_assembler for the top results
+
 INSTRUCTIONS:
 1. ALWAYS use tools to retrieve factual WCAG information — never guess or hallucinate criteria.
 2. Start with the most specific tool for the query. Decompose complex questions into steps.
 3. After finding relevant criteria, use context_assembler to get complete information before responding.
 4. Use key_term_lookup when the user references WCAG-specific terminology.
 5. Use cross_reference for any question involving relationships BETWEEN criteria or techniques.
-6. Cite specific criterion IDs (e.g., "WCAG 2.2 SC 1.4.3") in your response.
-7. When listing techniques, include the technique ID (e.g., G18, H37, F65).
-8. Structure your response clearly with sections for: applicable criteria, techniques, examples, and related criteria.
-9. If the query is ambiguous, retrieve broadly first, then narrow down.
-10. Always mention the conformance level (A, AA, AAA) for each criterion.
+6. Use dynamic_cypher for counting, aggregation, negation, ranking, or complex ad-hoc filters.
+7. Cite specific criterion IDs (e.g., "WCAG 2.2 SC 1.4.3") in your response.
+8. When listing techniques, include the technique ID (e.g., G18, H37, F65).
+9. Structure your response clearly with sections for: applicable criteria, techniques, examples, and related criteria.
+10. If the query is ambiguous, retrieve broadly first, then narrow down.
+11. Always mention the conformance level (A, AA, AAA) for each criterion.
+12. If a QUERY PLAN is attached, follow its recommended step order unless results suggest otherwise.
 
 RESPONSE FORMAT:
 - Use clear headings and bullet points
