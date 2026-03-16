@@ -1,12 +1,12 @@
 # Neo4j Agentic GraphRAG for WCAG 2.2
 
-> **An AI Agent that reasons over a WCAG 2.2 Knowledge Graph to answer accessibility compliance questions — powered by Neo4j, a 5-phase ETL pipeline, and a ReAct (Reasoning + Acting) agent with 6 specialized tools.**
+> **An AI Agent that reasons over a WCAG 2.2 Knowledge Graph to answer accessibility compliance questions — powered by Neo4j, a 5-phase ETL pipeline, and a ReAct (Reasoning + Acting) agent with 8 specialized tools.**
 
 ---
 
 ## 🎯 Project Overview
 
-This project builds an **Agentic RAG (Retrieval-Augmented Generation)** system on top of a **Neo4j Knowledge Graph** containing the full WCAG 2.2 specification. Unlike traditional vector-only RAG, the agent can **reason over structured relationships**, traverse the WCAG hierarchy, find techniques, analyze disability impact, and assemble rich context — all before generating a response.
+This project builds an **Agentic RAG (Retrieval-Augmented Generation)** system on top of a **Neo4j Knowledge Graph** containing the full WCAG 2.2 specification. Unlike traditional vector-only RAG, the agent can **reason over structured relationships**, traverse the WCAG hierarchy, find techniques, analyze disability impact, resolve terminology definitions, perform multi-hop cross-references, and assemble rich context — all before generating a response.
 
 ### What Makes This Different
 
@@ -25,21 +25,23 @@ This project builds an **Agentic RAG (Retrieval-Augmented Generation)** system o
 │                                                                            │
 │   Step 0               Step 1                  Step 2                     │
 │  ┌───────────────┐    ┌─────────────────────┐  ┌────────────────────────┐ │
-│  │  00_enrich     │    │  01_pipeline_wcag    │  │  02_agentic_rag_wcag  │ │
-│  │  _wcag_json.py │───▶│  _foundation.py     │─▶│  .py                  │ │
-│  │               │    │                     │  │                        │ │
+│  │  00_scrape     │    │  01_pipeline_wcag    │  │  02_agentic_rag_wcag  │ │
+│  │  _wcag_to      │───▶│  _foundation.py     │─▶│  .py                  │ │
+│  │  _csv.py       │    │                     │  │                        │ │
 │  │ Scrape W3C    │    │ Extract → Transform │  │ ReAct Agent with      │ │
-│  │ Understanding │    │ → Load → Validate   │  │ 6 tools over Neo4j    │ │
+│  │ Understanding │    │ → Load → Validate   │  │ 8 tools over Neo4j    │ │
 │  │ pages         │    │ into Neo4j KG       │  │ Knowledge Graph       │ │
 │  └───────────────┘    └─────────────────────┘  └────────────────────────┘ │
 │         │                       │                         │                │
 │         ▼                       ▼                         ▼                │
 │  wcag_22_guidelines      ┌───────────┐         ┌──────────────────┐      │
-│  _enriched.json          │  Neo4j    │◀────────│  User queries    │      │
+│                          │  Neo4j    │◀────────│  User queries    │      │
 │                          │  WCAG KG  │         │  answered with   │      │
-│                          │ (11 node  │         │  graph-grounded  │      │
-│                          │  types)   │         │  citations       │      │
-│                          └───────────┘         └──────────────────┘      │
+│                          │ (13 node  │         │  graph-grounded  │      │
+│                          │  types,   │         │  citations       │      │
+│                          │  2,418    │         └──────────────────┘      │
+│                          │  nodes)   │                                    │
+│                          └───────────┘                                    │
 └────────────────────────────────────────────────────────────────────────────┘
 ```
 
@@ -70,10 +72,14 @@ The agent follows a **ReAct (Reasoning + Acting)** loop — it doesn't just retr
 │    │ Graph   │ │ Semantic │ │Technique│ │ Rule    │ │          │
 │    │Traversal│ │ Search   │ │ Finder  │ │ Engine  │ │          │
 │    └─────────┘ └──────────┘ └────────┘ └─────────┘ │          │
-│         ┌────────────┐  ┌──────────────┐            │          │
-│         │  Impact    │  │   Context    │◀───────────┘          │
-│         │  Analysis  │  │  Assembler   │  (final step: always) │
-│         └────────────┘  └──────────────┘                       │
+│    ┌─────────┐ ┌──────────┐ ┌──────────────┐       │          │
+│    │ Impact  │ │ Key Term │ │Cross-        │       │          │
+│    │Analysis │ │ Lookup   │ │Reference     │       │          │
+│    └─────────┘ └──────────┘ └──────────────┘       │          │
+│                   ┌──────────────┐                   │          │
+│                   │   Context    │◀──────────────────┘          │
+│                   │  Assembler   │  (final step: always)        │
+│                   └──────────────┘                               │
 │                │               │                                │
 │                └───────┬───────┘                                │
 │                        ▼                                        │
@@ -98,18 +104,20 @@ The agent works **with or without an LLM**:
 
 Rule-based mode is ideal for testing, CI pipelines, and environments without LLM access. The LLM mode adds natural language understanding and more nuanced tool orchestration.
 
-### 6 Specialized Tools
+### 8 Specialized Tools
 
 Each tool is backed by targeted Cypher queries against the WCAG Knowledge Graph:
 
 | # | Tool | What It Does | Trigger Examples |
 |---|------|-------------|-----------------|
 | 1 | **`graph_traversal`** | Navigate the WCAG hierarchy (Principle → Guideline → Criterion) | "Show me guideline 2.1", "Get criterion 1.4.3" |
-| 2 | **`semantic_search`** | Keyword search across titles, descriptions, intent, goals | "color contrast requirements", "keyboard navigation" |
+| 2 | **`semantic_search`** | Keyword search across criteria, examples, benefits, and key terms | "color contrast requirements", "keyboard navigation" |
 | 3 | **`technique_finder`** | Find sufficient, advisory, and failure techniques per criterion | "How do I comply with 1.1.1?", "What failures exist for 2.4.7?" |
 | 4 | **`rule_engine`** | Compliance checking by element type, disability, level, or WCAG version | "What rules apply to forms?", "What's new in WCAG 2.2?" |
 | 5 | **`impact_analysis`** | Disability and input modality impact analysis | "Which criteria affect blind users?", "Keyboard-only requirements" |
-| 6 | **`context_assembler`** | Builds LLM-ready structured context from full graph subgraphs | Auto-called as final step to assemble response context |
+| 6 | **`key_term_lookup`** | Look up WCAG key term definitions from 725 formal terms | "What does programmatically determined mean?", "Define text alternative" |
+| 7 | **`cross_reference`** | Multi-hop graph walks: related chains, shared techniques, disability overlap, ripple effects | "If I fix 2.1.1, what else improves?", "Overlap between blindness and motor?" |
+| 8 | **`context_assembler`** | Builds LLM-ready structured context from full graph subgraphs including key terms and related resources | Auto-called as final step to assemble response context |
 
 ### Agent Usage
 
@@ -140,10 +148,60 @@ python 02_agentic_rag_wcag.py --interactive
 🔍 Show me the full WCAG hierarchy
 🔍 What are the failure patterns for 1.1.1?
 🔍 Which criteria impact cognitive disabilities?
+🔍 What does programmatically determined mean?
+🔍 If I fix keyboard issues for 2.1.1, what else benefits?
+🔍 Which criteria overlap between color blindness and low vision?
+🔍 What does technique H37 cover?
+🔍 What shared techniques apply to both 1.1.1 and 4.1.2?
 ```
 
-### Example Agent Trace
+### Example Agent Traces
 
+**Terminology lookup (2 steps, 8s):**
+```
+──────────────────────────────────────────────────
+QUERY: What does programmatically determined mean?
+──────────────────────────────────────────────────
+  Step 1 [🔧 ACT]
+    Tool: key_term_lookup({"term": "programmatically determined"})
+    Result: ✅ Found definition + 26 criteria that use this term
+
+  Step 2 [💬 RESPOND]
+    📖 programmatically determined: determined by software from
+       author-supplied data in a way that different user agents,
+       including assistive technologies, can extract and present
+       this information to users in various modalities.
+    Used in: 1.1.1, 1.2.2, 1.3.1, 1.3.2, 1.3.5, ... (+21 more)
+
+──────────────────────────────────────────────────
+COMPLETED in 8.04s (2 steps, tools: [key_term_lookup])
+──────────────────────────────────────────────────
+```
+
+**Ripple effect analysis (3 steps, 25s):**
+```
+──────────────────────────────────────────────────
+QUERY: If I fix keyboard issues for 2.1.1, what else benefits?
+──────────────────────────────────────────────────
+  Step 1 [🔧 ACT]
+    Tool: cross_reference({"analysis_type": "fix_ripple_effect", "criterion_id": "2.1.1"})
+    Result: ✅ 14 affected criteria (9 directly related + 5 via shared techniques)
+
+  Step 2 [🔧 ACT]
+    Tool: context_assembler({"criterion_ids": ["1.3.1", "2.1.3", "2.4.7", "2.4.13", ...]})
+    Result: ✅ Assembled full context for 14 criteria
+
+  Step 3 [💬 RESPOND]
+    Directly related: 2.4.7 Focus Visible, 3.2.1 On Focus, 4.1.2 Name/Role/Value...
+    Shared techniques: 2.4.3 Focus Order, 2.4.4 Link Purpose...
+    Total affected: 14 criteria across Levels A, AA, AAA
+
+──────────────────────────────────────────────────
+COMPLETED in 25.27s (3 steps, tools: [cross_reference, context_assembler])
+──────────────────────────────────────────────────
+```
+
+**Element-based rule engine (4 steps, <1s):**
 ```
 ──────────────────────────────────────────────────
 QUERY: How do I make images accessible?
@@ -157,30 +215,20 @@ QUERY: How do I make images accessible?
 
   Step 3 [🔧 ACT]
     Tool: context_assembler({"criterion_ids": ["1.1.1", "1.4.5", "1.4.9"]})
-    Result: ✅ Assembled hierarchy + techniques + examples + benefits
+    Result: ✅ Assembled hierarchy + techniques + examples + benefits + key terms
 
   Step 4 [💬 RESPOND]
-    Structured response with:
     ═══════════════════════════════════════
     WCAG 1.1.1: Non-text Content
     ═══════════════════════════════════════
-    Principle:  Perceivable
-    Guideline:  1.1 Text Alternatives
-    Level:      A
-
     Techniques:
-      ✅ [G94]  Short text alternative providing descriptive info
       ✅ [H37]  Using alt attributes on img elements
-      ✅ [ARIA6] Using aria-label for objects
       ❌ [F65]  Failure: omitting alt attribute on img
-      ❌ [F30]  Failure: Using text alternatives that are not alternatives
-
-    Automated Test Rules:
-      🧪 Image has non-empty accessible name
-
-    Related Criteria:
-      → 1.2.1 Audio-only and Video-only (Level A)
-      → 4.1.2 Name, Role, Value (Level A)
+    Key Terms:
+      📖 text alternative: Text that is programmatically associated...
+      📖 non-text content: Any content that is not a sequence of characters...
+    Related Resources:
+      🔗 WAI Web Accessibility Tutorials: Images — ...
 
 ──────────────────────────────────────────────────
 COMPLETED in 0.34s (4 steps, tools: [rule_engine, context_assembler])
@@ -196,9 +244,12 @@ COMPLETED in 0.34s (4 steps, tools: [rule_engine, context_assembler])
 | Dynamic tool selection | ❌ Fixed pipeline | ❌ Fixed query | ✅ Agent plans per query |
 | Technique lookup | ❌ Embedded in text | ⚠️ Manual query | ✅ Dedicated tool |
 | Disability impact | ❌ Not structured | ⚠️ If you know Cypher | ✅ Natural language → analysis |
+| Terminology resolution | ❌ Not indexed | ⚠️ Manual query | ✅ 725 key terms searchable |
+| Cross-reference analysis | ❌ Lost | ⚠️ Manual multi-query | ✅ Multi-hop graph walks |
+| Ripple effect mapping | ❌ Impossible | ⚠️ Complex Cypher | ✅ One-step tool call |
 | Reasoning transparency | ❌ Black box | ❌ No trace | ✅ Full `AgentTrace` log |
 | Works without LLM | N/A (requires LLM) | ✅ (Cypher only) | ✅ Rule-based fallback |
-| Context assembly | Token-limited chunks | Manual RETURN clause | ✅ Auto-assembled rich context |
+| Context assembly | Token-limited chunks | Manual RETURN clause | ✅ Auto-assembled with key terms + resources |
 
 ---
 
@@ -206,7 +257,7 @@ COMPLETED in 0.34s (4 steps, tools: [rule_engine, context_assembler])
 
 ### Graph Schema
 
-The ETL pipeline creates an 11-node-type knowledge graph with 13 relationship types:
+The ETL pipeline creates a 13-node-type knowledge graph (2,418 nodes) with 15 relationship types:
 
 ```
 ┌──────────────────────────────────────────────────────────────────────┐
@@ -217,17 +268,19 @@ The ETL pipeline creates an 11-node-type knowledge graph with 13 relationship ty
 │    ↑ PART_OF                                                         │
 │  WCAGGuideline (13)                                                  │
 │    ↑ PART_OF                                                         │
-│  WCAGCriterion (86+) ──→ HAS_LEVEL ──→ ConformanceLevel (3)         │
+│  WCAGCriterion (87) ──→ HAS_LEVEL ──→ ConformanceLevel (3)          │
 │    │                                                                 │
-│    ├─ HAS_SPECIAL_CASE ──→ WCAGSpecialCase                           │
-│    ├─ HAS_NOTE ──→ WCAGNote                                          │
-│    ├─ HAS_REFERENCE ──→ WCAGReference                                │
-│    ├─ HAS_TECHNIQUE ──→ WCAGTechnique  (sufficient)                  │
+│    ├─ HAS_SPECIAL_CASE ──→ WCAGSpecialCase (91)                      │
+│    ├─ HAS_NOTE ──→ WCAGNote (41)                                     │
+│    ├─ HAS_REFERENCE ──→ WCAGReference (184)                          │
+│    ├─ HAS_TECHNIQUE ──→ WCAGTechnique (412) (sufficient)             │
 │    ├─ HAS_ADVISORY_TECHNIQUE ──→ WCAGTechnique  (advisory)           │
 │    ├─ HAS_FAILURE ──→ WCAGTechnique  (failure patterns)              │
-│    ├─ HAS_TEST_RULE ──→ WCAGTestRule  (ACT automated tests)          │
-│    ├─ HAS_EXAMPLE ──→ WCAGExample                                    │
-│    ├─ HAS_BENEFIT ──→ WCAGBenefit                                    │
+│    ├─ HAS_TEST_RULE ──→ WCAGTestRule (109) (ACT automated tests)     │
+│    ├─ HAS_EXAMPLE ──→ WCAGExample (284)                              │
+│    ├─ HAS_BENEFIT ──→ WCAGBenefit (204)                              │
+│    ├─ HAS_KEY_TERM ──→ WCAGKeyTerm (725)  ← NEW                     │
+│    ├─ HAS_RELATED_RESOURCE ──→ WCAGRelatedResource (261) ← NEW      │
 │    └─ RELATED_CRITERION / RELATED_GUIDELINE ──→ cross-refs           │
 │                                                                      │
 │  Enriched properties on WCAGCriterion:                               │
@@ -244,15 +297,17 @@ The ETL pipeline creates an 11-node-type knowledge graph with 13 relationship ty
 |---|-----------|-------|-------------|
 | 1 | **WCAGPrinciple** | 4 | Perceivable, Operable, Understandable, Robust |
 | 2 | **WCAGGuideline** | 13 | e.g., "1.1 Text Alternatives", "2.1 Keyboard Accessible" |
-| 3 | **WCAGCriterion** | 86+ | Testable success criteria with level A/AA/AAA. Enriched with `intent`, `wcag_version`, `automatable`, `disability_impact`, `input_types_affected`, `technology_applicability`, `in_brief_goal`, `in_brief_what_to_do`, `in_brief_why_important` |
+| 3 | **WCAGCriterion** | 87 | Testable success criteria with level A/AA/AAA. Enriched with `intent`, `wcag_version`, `automatable`, `disability_impact`, `input_types_affected`, `technology_applicability`, `in_brief_goal`, `in_brief_what_to_do`, `in_brief_why_important` |
 | 4 | **ConformanceLevel** | 3 | A (minimum), AA (target), AAA (highest) |
-| 5 | **WCAGSpecialCase** | — | Exceptions and special conditions per criterion |
-| 6 | **WCAGNote** | — | Clarifying notes and additional context |
-| 7 | **WCAGReference** | — | Links to "How to Meet" and "Understanding" docs |
-| 8 | **WCAGTechnique** *(enriched)* | 300+ | W3C techniques: `tech_id`, `title`, `url`, `technology` (html/css/aria/pdf/script), `category` (sufficient/advisory/failures). Globally deduplicated. |
-| 9 | **WCAGTestRule** *(enriched)* | 50+ | ACT rules for automated accessibility testing |
-| 10 | **WCAGExample** *(enriched)* | 200+ | Concrete examples illustrating compliance |
-| 11 | **WCAGBenefit** *(enriched)* | 100+ | Who benefits and how (per disability category) |
+| 5 | **WCAGSpecialCase** | 91 | Exceptions and special conditions per criterion |
+| 6 | **WCAGNote** | 41 | Clarifying notes and additional context |
+| 7 | **WCAGReference** | 184 | Links to "How to Meet" and "Understanding" docs |
+| 8 | **WCAGTechnique** *(enriched)* | 412 | W3C techniques: `tech_id`, `title`, `url`, `technology` (html/css/aria/pdf/script), `category` (sufficient/advisory/failures). Globally deduplicated. |
+| 9 | **WCAGTestRule** *(enriched)* | 109 | ACT rules for automated accessibility testing |
+| 10 | **WCAGExample** *(enriched)* | 284 | Concrete examples illustrating compliance |
+| 11 | **WCAGBenefit** *(enriched)* | 204 | Who benefits and how (per disability category) |
+| 12 | **WCAGKeyTerm** *(enriched)* | 725 | Formal WCAG term definitions (e.g., "programmatically determined", "text alternative"). Queried by `key_term_lookup` tool. |
+| 13 | **WCAGRelatedResource** *(enriched)* | 261 | External resources and related documentation. Surfaced in context assembler output. |
 
 ### Relationship Types
 
@@ -271,6 +326,8 @@ The ETL pipeline creates an 11-node-type knowledge graph with 13 relationship ty
 | `HAS_TEST_RULE` *(enriched)* | Criterion → TestRule | ACT automated tests |
 | `HAS_EXAMPLE` *(enriched)* | Criterion → Example | Illustrative examples |
 | `HAS_BENEFIT` *(enriched)* | Criterion → Benefit | Benefit descriptions |
+| `HAS_KEY_TERM` *(enriched)* | Criterion → KeyTerm | Formal WCAG definitions |
+| `HAS_RELATED_RESOURCE` *(enriched)* | Criterion → RelatedResource | External resources |
 
 ---
 
@@ -293,17 +350,17 @@ The ETL pipeline (`01_pipeline_wcag_foundation.py`) runs in 5 clearly separated 
 
 | Phase | Name | What It Does |
 |-------|------|-------------|
-| **0** | Pre-flight | Cleans auxiliary nodes, creates constraints and indexes |
+| **0** | Pre-flight | Full DB wipe (clean reload), creates constraints and indexes |
 | **1** | Extract | Reads WCAG JSON, validates structure (required keys, valid levels) |
 | **2** | Transform | Flattens hierarchy into batch-ready records, deduplicates references, detects enriched fields |
-| **3** | Load | Batch `UNWIND` writes to Neo4j (~15 transactions for all node/edge types) |
+| **3** | Load | Batch `UNWIND` writes to Neo4j (~18 transactions for all node/edge types) |
 | **4** | Validate | Checks hierarchy chains, code/ref_id consistency, conformance level linkage, enriched data |
 
-The pipeline **auto-detects** whether the source JSON is base or enriched and adjusts accordingly — enriched data yields 4 additional node types and 6 additional relationship types.
+The pipeline **auto-detects** whether the source JSON is base or enriched and adjusts accordingly — enriched data yields 6 additional node types and 8 additional relationship types.
 
 ### Data Enrichment
 
-The enrichment script (`00_enrich_wcag_json.py`) scrapes each criterion's [W3C Understanding page](https://www.w3.org/WAI/WCAG22/Understanding/) to add:
+The enrichment script (`00_scrape_wcag_to_csv.py`) scrapes each criterion's [W3C Understanding page](https://www.w3.org/WAI/WCAG22/Understanding/) to add:
 
 | Enriched Field | Source | Value for Agentic RAG |
 |---|---|---|
@@ -315,6 +372,8 @@ The enrichment script (`00_enrich_wcag_json.py`) scrapes each criterion's [W3C U
 | `test_rules` | Test Rules section | ACT rules — powers automation classification |
 | `examples` | Examples section | Concrete illustrations — context assembler |
 | `benefits` | Benefits section | Disability groups helped — impact analysis tool |
+| `key_terms` | Key Terms section | Formal WCAG definitions (725 terms) — powers `key_term_lookup` tool |
+| `related_resources` | Resources section | External references (261 resources) — surfaced in context assembler |
 | `wcag_version` | Derived | 2.0 / 2.1 / 2.2 — version diff queries |
 | `automatable` | Classified | full / partial / manual — automation tool |
 | `disability_impact` | Mapped | blindness, cognitive, motor, etc. — impact analysis |
@@ -328,28 +387,32 @@ The enrichment script (`00_enrich_wcag_json.py`) scrapes each criterion's [W3C U
   WCAG 2.2 Foundation — ETL Pipeline
 ==============================================================
 PHASE 0 ▸ Pre-flight checks
-  Cleaned auxiliary WCAG nodes
+  Wiped ALL WCAG nodes for clean reload
   Constraints and indexes ready
 PHASE 1 ▸ Extract — reading wcag_22_guidelines_enriched.json
   Validated 4 principles — structure OK
 PHASE 2 ▸ Transform — normalizing records
   Detected ENRICHED JSON — extracting techniques, examples, test rules, benefits
-  Transformed → 4 principles, 13 guidelines, 86 criteria, ...
-  Enriched    → 300+ techniques, 50+ test rules, 200+ examples, 100+ benefits
+  Transformed → 4 principles, 13 guidelines, 87 criteria, ...
+  Enriched    → 412 techniques, 109 test rules, 284 examples, 204 benefits
+  Key Terms   → 725 terms, Related Resources → 261 resources
 PHASE 3 ▸ Load — writing to Neo4j
   Loaded 3 conformance levels
   Loaded 4 principles
   Loaded 13 guidelines
-  Loaded 86 criteria
-  Loaded 300+ technique nodes
-  Loaded 50+ test rules
-  Loaded 200+ examples
-  Loaded 100+ benefits
+  Loaded 87 criteria
+  Loaded 412 technique nodes
+  Loaded 109 test rules
+  Loaded 284 examples
+  Loaded 204 benefits
+  Loaded 725 key terms
+  Loaded 261 related resources
 PHASE 4 ▸ Validate — integrity checks
-  PASS — All 86 criteria have complete hierarchy chains
-  PASS — WCAG version distribution: 2.0 (50), 2.1 (27), 2.2 (9)
-  PASS — Automation classification: full (12), partial (35), manual (39)
-✅ All validation checks passed
+  PASS — All 87 criteria have complete hierarchy chains
+  PASS — 2,418 total nodes across 13 node types
+  PASS — WCAG version distribution: 2.0 (50), 2.1 (28), 2.2 (9)
+  PASS — Automation classification: full (12), partial (35), manual (40)
+✅ All validation checks passed (56.41s)
 ```
 
 ---
@@ -454,12 +517,14 @@ WCAG JSON → ETL → Neo4j → Agent [Think → Tools → Observe → Repeat] �
 | **Relationship Queries** | ❌ | ⚠️ Limited | ✅ | ✅ Agent-driven |
 | **Hierarchy Traversal** | ❌ | ⚠️ Chunked | ✅ | ✅ Multi-hop |
 | **Multi-step Reasoning** | ❌ | ❌ | ❌ | ✅ ReAct loop |
-| **Tool Selection** | N/A | N/A | Manual | ✅ Dynamic |
+| **Tool Selection** | N/A | N/A | Manual | ✅ 8 dynamic tools |
 | **Explainability** | ❌ Black box | ⚠️ Scores | ✅ Cypher | ✅ Full trace |
 | **Cost** | $$$$ GPU | $$ Embeddings | $ Queries | ✅ $ Queries |
 | **WCAG Updates** | Retrain | Re-embed | Add nodes | ✅ Add nodes |
-| **Cross-references** | ❌ Lost | ❌ Lost | ✅ Explicit | ✅ Agent traverses |
-| **Disability Analysis** | ❌ | ❌ | Manual query | ✅ Dedicated tool |
+| **Cross-references** | ❌ Lost | ❌ Lost | ✅ Explicit | ✅ Agent traverses multi-hop |
+| **Disability Analysis** | ❌ | ❌ | Manual query | ✅ Dedicated tool + overlap |
+| **Terminology** | ❌ | ⚠️ Might find | Manual query | ✅ 725 key terms indexed |
+| **Ripple Effects** | ❌ | ❌ | Complex Cypher | ✅ One-step cross_reference |
 
 ### Context Quality: Agentic GraphRAG vs Vector RAG
 
@@ -503,6 +568,15 @@ Special Cases:
   • [exception] Controls/Input: If non-text content is a control...
   • [exception] Time-Based Media: If non-text content is time-based media...
 
+Key Terms:
+  📖 text alternative: Text that is programmatically associated with non-text...
+  📖 non-text content: Any content that is not a sequence of characters...
+  📖 assistive technology: Hardware and/or software that acts as a user agent...
+
+Related Resources:
+  🔗 WAI Web Accessibility Tutorials: Images — https://www.w3.org/WAI/tutorials/images/
+  🔗 HTML5: Requirements for alt text — https://www.w3.org/TR/html5/...
+
 Related Criteria:
   → 1.2.1 Audio-only and Video-only (Level A)
   → 4.1.2 Name, Role, Value (Level A)
@@ -536,14 +610,14 @@ cp .env.example .env
 ### Running the Full Pipeline
 
 ```bash
-# Step 0 (optional but recommended): Enrich WCAG data from W3C (~2 min)
-python 00_enrich_wcag_json.py
+# Step 0 (optional but recommended): Scrape & enrich WCAG data from W3C (~2 min)
+python 00_scrape_wcag_to_csv.py
 
-# Step 1: Load into Neo4j Knowledge Graph
+# Step 1: Load into Neo4j Knowledge Graph (2,418 nodes)
 # (update WCAG_JSON_FILE in .env to use enriched version)
 python 01_pipeline_wcag_foundation.py
 
-# Step 2: Start the Agentic RAG
+# Step 2: Start the Agentic RAG (8 tools)
 python 02_agentic_rag_wcag.py --interactive
 ```
 
@@ -670,6 +744,40 @@ RETURN c.ref_id, c.title, c.intent, c.automatable,
        collect(DISTINCT b.description) AS benefits;
 ```
 
+### Example 10: Key Term Lookup *(enriched)*
+
+```cypher
+// Find a key term definition and which criteria use it
+MATCH (c:WCAGCriterion)-[:HAS_KEY_TERM]->(kt:WCAGKeyTerm)
+WHERE toLower(kt.term) CONTAINS 'programmatically determined'
+RETURN kt.term, kt.definition,
+       collect(DISTINCT {ref_id: c.ref_id, title: c.title}) AS used_in_criteria;
+```
+
+### Example 11: Cross-Reference — Fix Ripple Effect *(enriched)*
+
+```cypher
+// If I fix keyboard issues (2.1.1), what other criteria also benefit?
+MATCH (c:WCAGCriterion {ref_id: '2.1.1'})
+OPTIONAL MATCH (c)-[:RELATED_CRITERION]-(related:WCAGCriterion)
+OPTIONAL MATCH (c)-[:HAS_TECHNIQUE]->(t:WCAGTechnique)<-[:HAS_TECHNIQUE]-(shared:WCAGCriterion)
+WHERE shared.ref_id <> '2.1.1'
+RETURN c.title AS source,
+       collect(DISTINCT related.ref_id) AS directly_related,
+       collect(DISTINCT shared.ref_id) AS shared_technique_siblings;
+```
+
+### Example 12: Disability Overlap Between Two Categories *(enriched)*
+
+```cypher
+// Find criteria that address both color blindness AND low vision
+MATCH (c:WCAGCriterion)
+WHERE any(d IN c.disability_impact WHERE toLower(d) CONTAINS 'color_blind')
+  AND any(d IN c.disability_impact WHERE toLower(d) CONTAINS 'low_vision')
+RETURN c.ref_id, c.title, c.level, c.disability_impact
+ORDER BY c.ref_id;
+```
+
 ---
 
 ## 📁 Project Structure
@@ -677,12 +785,14 @@ RETURN c.ref_id, c.title, c.intent, c.automatable,
 ```
 Neo4J-GraphRAG-ETL-pipeline/
 │
-├── 00_enrich_wcag_json.py              # Step 0: Scrape W3C Understanding pages → enriched JSON
-├── 01_pipeline_wcag_foundation.py      # Step 1: 5-phase ETL pipeline → Neo4j Knowledge Graph
-├── 02_agentic_rag_wcag.py             # Step 2: Agentic RAG with 6 tools + ReAct loop
+├── 00_scrape_wcag_to_csv.py            # Step 0: Scrape W3C Understanding pages → CSV/Excel/enriched JSON
+├── 01_pipeline_wcag_foundation.py      # Step 1: 5-phase ETL pipeline → Neo4j Knowledge Graph (2,418 nodes)
+├── 02_agentic_rag_wcag.py             # Step 2: Agentic RAG with 8 tools + ReAct loop
 │
-├── wcag_22_guidelines.json             # Base WCAG 2.2 source data (86 criteria)
+├── wcag_22_guidelines.json             # Base WCAG 2.2 source data (87 criteria)
 ├── wcag_22_guidelines_enriched.json    # Enriched data (generated by Step 0, git-ignored)
+├── wcag_22_all_criteria.csv            # Flat CSV export (generated by Step 0, git-ignored)
+├── wcag_22_all_criteria.xlsx           # Excel export (generated by Step 0, git-ignored)
 │
 ├── requirements.txt                    # Python dependencies
 ├── .env.example                        # Environment variable template
@@ -704,12 +814,14 @@ The pipeline creates:
 - **Indexes** on `code`, `title`, `level`, `wcag_version`, `automatable` for WCAGCriterion
 - **Indexes** on `technology`, `category` for WCAGTechnique
 - **Index** on `title` for WCAGTestRule
+- **Index** on `term` for WCAGKeyTerm
+- **Index** on `url` for WCAGRelatedResource
 
 ### ETL Data Integrity
 
 - ✅ **Idempotent**: Safe to run multiple times (uses `MERGE`)
 - ✅ **Referential Integrity**: All relationships validated in Phase 4
-- ✅ **Batch Performance**: UNWIND-based writes (~15 transactions vs 200+ individual)
+- ✅ **Batch Performance**: UNWIND-based writes (~18 transactions vs 200+ individual)
 - ✅ **Auto-Detection**: Pipeline detects base vs enriched JSON automatically
 
 ### Agent Transparency
@@ -741,12 +853,21 @@ CREATE (bug)-[:VIOLATES]->(c:WCAGCriterion {ref_id: '1.1.1'})
 ```python
 # Add Neo4j vector indexes for true semantic similarity
 # Agent combines: graph traversal + vector search + keyword matching
+# Enhanced SemanticSearchTool already searches across criteria, examples,
+# benefits, and key terms — vector embeddings would further improve recall
 ```
 
 ### Phase 6: WCAG 3.0 Support
 ```python
 # Extend the enrichment scraper and ETL for WCAG 3.0 when released
 # Agent automatically handles multi-version queries
+```
+
+### Phase 7: Scenario Evaluation Engine
+```python
+# Given a URL or screenshot, decompose into UI elements (form, modal, nav)
+# Then auto-invoke rule_engine per element type + cross_reference for overlaps
+# Generate a full audit checklist with prioritized findings
 ```
 
 ---
@@ -779,8 +900,9 @@ Contributions are welcome! Areas for improvement:
 - Neo4j vector index integration for hybrid search
 - REST API endpoint for the Agentic RAG
 - JIRA / Confluence connectors
+- Scenario evaluation engine (URL/screenshot → audit checklist)
 - Additional agent tools (e.g., code snippet generator, ARIA pattern recommender)
-- Test coverage for agent tools
+- Test coverage for all 8 agent tools
 
 ---
 

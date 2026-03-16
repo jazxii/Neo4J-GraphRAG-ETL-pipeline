@@ -410,7 +410,7 @@ class SemanticSearchTool(BaseTool):
         if not keywords:
             keywords = [query.lower()]
 
-        # Build WHERE clause for keyword matching
+        # Build WHERE clause for keyword matching on criterion properties
         where_conditions = []
         for i, kw in enumerate(keywords):
             param_key = f"kw{i}"
@@ -422,33 +422,99 @@ class SemanticSearchTool(BaseTool):
                 f"toLower(c.in_brief_what_to_do) CONTAINS ${param_key})"
             )
 
-        where_clause = " OR ".join(where_conditions)
+        direct_where = " OR ".join(where_conditions)
         params = {f"kw{i}": kw for i, kw in enumerate(keywords)}
         params["limit"] = limit
 
+        level_clause = ""
         if level_filter:
-            where_clause = f"({where_clause}) AND c.level = $level_filter"
+            level_clause = "AND c.level = $level_filter"
             params["level_filter"] = level_filter
 
+        # Extended search: also match via connected examples, benefits, key terms
+        # Use UNION to find criteria matched through connected nodes
         cypher = f"""
+            // Direct match on criterion properties
             MATCH (c:WCAGCriterion)
-            WHERE {where_clause}
+            WHERE ({direct_where}) {level_clause}
             OPTIONAL MATCH (c)-[:PART_OF]->(g:WCAGGuideline)-[:PART_OF]->(p:WCAGPrinciple)
             RETURN c.ref_id AS ref_id, c.title AS title,
                    c.level AS level, c.description AS description,
                    c.intent AS intent, c.wcag_version AS wcag_version,
                    c.in_brief_goal AS goal,
                    c.in_brief_what_to_do AS what_to_do,
-                   g.title AS guideline, p.title AS principle
-            ORDER BY c.ref_id
-            LIMIT $limit
+                   g.title AS guideline, p.title AS principle,
+                   'criterion' AS match_source
+
+            UNION
+
+            // Match via connected examples
+            MATCH (c:WCAGCriterion)-[:HAS_EXAMPLE]->(ex:WCAGExample)
+            WHERE ({" OR ".join(
+                f"toLower(ex.description) CONTAINS $kw{i}" for i in range(len(keywords))
+            )}) {level_clause}
+            OPTIONAL MATCH (c)-[:PART_OF]->(g:WCAGGuideline)-[:PART_OF]->(p:WCAGPrinciple)
+            RETURN DISTINCT c.ref_id AS ref_id, c.title AS title,
+                   c.level AS level, c.description AS description,
+                   c.intent AS intent, c.wcag_version AS wcag_version,
+                   c.in_brief_goal AS goal,
+                   c.in_brief_what_to_do AS what_to_do,
+                   g.title AS guideline, p.title AS principle,
+                   'example' AS match_source
+
+            UNION
+
+            // Match via key terms
+            MATCH (c:WCAGCriterion)-[:HAS_KEY_TERM]->(kt:WCAGKeyTerm)
+            WHERE ({" OR ".join(
+                f"(toLower(kt.term) CONTAINS $kw{i} OR toLower(kt.definition) CONTAINS $kw{i})" for i in range(len(keywords))
+            )}) {level_clause}
+            OPTIONAL MATCH (c)-[:PART_OF]->(g:WCAGGuideline)-[:PART_OF]->(p:WCAGPrinciple)
+            RETURN DISTINCT c.ref_id AS ref_id, c.title AS title,
+                   c.level AS level, c.description AS description,
+                   c.intent AS intent, c.wcag_version AS wcag_version,
+                   c.in_brief_goal AS goal,
+                   c.in_brief_what_to_do AS what_to_do,
+                   g.title AS guideline, p.title AS principle,
+                   'key_term' AS match_source
+
+            UNION
+
+            // Match via benefits
+            MATCH (c:WCAGCriterion)-[:HAS_BENEFIT]->(b:WCAGBenefit)
+            WHERE ({" OR ".join(
+                f"toLower(b.description) CONTAINS $kw{i}" for i in range(len(keywords))
+            )}) {level_clause}
+            OPTIONAL MATCH (c)-[:PART_OF]->(g:WCAGGuideline)-[:PART_OF]->(p:WCAGPrinciple)
+            RETURN DISTINCT c.ref_id AS ref_id, c.title AS title,
+                   c.level AS level, c.description AS description,
+                   c.intent AS intent, c.wcag_version AS wcag_version,
+                   c.in_brief_goal AS goal,
+                   c.in_brief_what_to_do AS what_to_do,
+                   g.title AS guideline, p.title AS principle,
+                   'benefit' AS match_source
         """
 
         try:
             results, elapsed = self._timed_query(cypher, params)
+
+            # Deduplicate by ref_id, keeping match_source info
+            seen = {}
+            for row in results:
+                rid = row["ref_id"]
+                if rid not in seen:
+                    seen[rid] = row
+                    seen[rid]["match_sources"] = [row.pop("match_source", "criterion")]
+                else:
+                    src = row.get("match_source", "")
+                    if src and src not in seen[rid]["match_sources"]:
+                        seen[rid]["match_sources"].append(src)
+
+            deduped = sorted(seen.values(), key=lambda x: x["ref_id"])[:limit]
+
             return ToolResult(
                 tool_name=self.name, success=True,
-                data=results, execution_time=elapsed,
+                data=deduped, execution_time=elapsed,
                 cypher_used=cypher.strip()
             )
         except Exception as e:
@@ -952,7 +1018,393 @@ class ImpactAnalysisTool(BaseTool):
 
 
 # ============================================================
-# TOOL 6: CONTEXT ASSEMBLER
+# TOOL 6: KEY TERM LOOKUP
+# ============================================================
+class KeyTermLookupTool(BaseTool):
+    """
+    Look up WCAG key term definitions from the knowledge graph.
+    Queries 725+ WCAGKeyTerm nodes to answer terminology questions
+    like 'what does programmatically determined mean?' or
+    'define text alternative'.
+    """
+
+    @property
+    def name(self) -> str:
+        return "key_term_lookup"
+
+    @property
+    def description(self) -> str:
+        return (
+            "Look up WCAG key term definitions and find which criteria use a term. "
+            "Use when the user asks 'what does X mean?', 'define X', or references "
+            "WCAG-specific terminology like 'programmatically determined', "
+            "'text alternative', 'essential', 'assistive technology', etc."
+        )
+
+    @property
+    def parameters(self) -> dict:
+        return {
+            "type": "object",
+            "properties": {
+                "term": {
+                    "type": "string",
+                    "description": "The term to look up (e.g., 'programmatically determined', 'text alternative')"
+                },
+                "criterion_id": {
+                    "type": "string",
+                    "description": "Optional: get key terms for a specific criterion",
+                    "default": ""
+                },
+            },
+            "required": ["term"],
+        }
+
+    def execute(self, **kwargs) -> ToolResult:
+        term = kwargs.get("term", "").strip()
+        criterion_id = kwargs.get("criterion_id", "").strip()
+
+        if not term and not criterion_id:
+            return ToolResult(
+                tool_name=self.name, success=False,
+                error="Either 'term' or 'criterion_id' is required"
+            )
+
+        # If criterion_id is provided, get all key terms for that criterion
+        if criterion_id:
+            cypher = """
+                MATCH (c:WCAGCriterion {ref_id: $criterion_id})-[:HAS_KEY_TERM]->(kt:WCAGKeyTerm)
+                RETURN kt.term AS term, kt.definition AS definition,
+                       c.ref_id AS criterion_id, c.title AS criterion_title
+                ORDER BY kt.term
+            """
+            results, elapsed = self._timed_query(cypher, {"criterion_id": criterion_id})
+            return ToolResult(
+                tool_name=self.name, success=True,
+                data={"criterion_id": criterion_id, "key_terms": results},
+                execution_time=elapsed,
+            )
+
+        # Search for a specific term across all criteria
+        cypher = """
+            MATCH (c:WCAGCriterion)-[:HAS_KEY_TERM]->(kt:WCAGKeyTerm)
+            WHERE toLower(kt.term) CONTAINS toLower($term)
+            RETURN kt.term AS term, kt.definition AS definition,
+                   collect(DISTINCT {ref_id: c.ref_id, title: c.title}) AS used_in_criteria
+            ORDER BY kt.term
+        """
+        results, elapsed = self._timed_query(cypher, {"term": term})
+
+        # Deduplicate terms (same term appears across criteria)
+        seen_terms = {}
+        for row in results:
+            t = row["term"]
+            if t not in seen_terms:
+                seen_terms[t] = {
+                    "term": t,
+                    "definition": row["definition"],
+                    "used_in_criteria": row["used_in_criteria"],
+                }
+            else:
+                # Merge criteria lists
+                existing_ids = {c["ref_id"] for c in seen_terms[t]["used_in_criteria"]}
+                for c in row["used_in_criteria"]:
+                    if c["ref_id"] not in existing_ids:
+                        seen_terms[t]["used_in_criteria"].append(c)
+
+        return ToolResult(
+            tool_name=self.name, success=True,
+            data={
+                "search_term": term,
+                "results_count": len(seen_terms),
+                "terms": list(seen_terms.values()),
+            },
+            execution_time=elapsed,
+        )
+
+
+# ============================================================
+# TOOL 7: CROSS-REFERENCE RESOLVER
+# ============================================================
+class CrossReferenceTool(BaseTool):
+    """
+    Multi-hop graph walks for cross-referencing:
+    - Find all criteria related to a given criterion (and their relations)
+    - Find shared techniques across multiple criteria
+    - Find overlapping disability impacts between criteria
+    - Map the ripple effect of fixing/breaking a criterion
+    """
+
+    @property
+    def name(self) -> str:
+        return "cross_reference"
+
+    @property
+    def description(self) -> str:
+        return (
+            "Perform multi-hop cross-referencing across the WCAG knowledge graph. "
+            "Use for questions like 'what criteria are related to 1.4.3 and share "
+            "the same techniques?', 'if I fix keyboard issues, what else improves?', "
+            "'which criteria overlap between color blindness and low vision?', or "
+            "'what techniques cover multiple criteria?'."
+        )
+
+    @property
+    def parameters(self) -> dict:
+        return {
+            "type": "object",
+            "properties": {
+                "analysis_type": {
+                    "type": "string",
+                    "enum": [
+                        "related_chain",        # SC → related SCs → their related SCs (2-hop)
+                        "shared_techniques",    # Which techniques apply to multiple given criteria
+                        "disability_overlap",   # Criteria overlap between two disability categories
+                        "technique_coverage",   # Given a technique, which criteria does it satisfy
+                        "fix_ripple_effect",    # If I fix SC X, what other SCs benefit
+                    ],
+                    "description": "Type of cross-reference analysis"
+                },
+                "criterion_id": {
+                    "type": "string",
+                    "description": "Primary criterion ref_id (for related_chain, fix_ripple_effect)"
+                },
+                "criterion_ids": {
+                    "type": "array",
+                    "items": {"type": "string"},
+                    "description": "List of criterion IDs (for shared_techniques)"
+                },
+                "disability_a": {
+                    "type": "string",
+                    "description": "First disability category (for disability_overlap)"
+                },
+                "disability_b": {
+                    "type": "string",
+                    "description": "Second disability category (for disability_overlap)"
+                },
+                "technique_id": {
+                    "type": "string",
+                    "description": "Technique ID like G18, H37 (for technique_coverage)"
+                },
+            },
+            "required": ["analysis_type"],
+        }
+
+    def execute(self, **kwargs) -> ToolResult:
+        analysis_type = kwargs.get("analysis_type", "")
+
+        try:
+            if analysis_type == "related_chain":
+                return self._related_chain(kwargs.get("criterion_id", ""))
+            elif analysis_type == "shared_techniques":
+                return self._shared_techniques(kwargs.get("criterion_ids", []))
+            elif analysis_type == "disability_overlap":
+                return self._disability_overlap(
+                    kwargs.get("disability_a", ""),
+                    kwargs.get("disability_b", ""),
+                )
+            elif analysis_type == "technique_coverage":
+                return self._technique_coverage(kwargs.get("technique_id", ""))
+            elif analysis_type == "fix_ripple_effect":
+                return self._fix_ripple_effect(kwargs.get("criterion_id", ""))
+            else:
+                return ToolResult(
+                    tool_name=self.name, success=False,
+                    error=f"Unknown analysis_type: {analysis_type}"
+                )
+        except Exception as e:
+            return ToolResult(
+                tool_name=self.name, success=False, error=str(e)
+            )
+
+    def _related_chain(self, criterion_id: str) -> ToolResult:
+        """2-hop related criteria chain: SC → related → their related."""
+        cypher = """
+            MATCH (c:WCAGCriterion {ref_id: $cid})
+            OPTIONAL MATCH (c)-[:RELATED_CRITERION]->(r1:WCAGCriterion)
+            OPTIONAL MATCH (r1)-[:RELATED_CRITERION]->(r2:WCAGCriterion)
+            WHERE r2.ref_id <> $cid
+            WITH c, collect(DISTINCT {
+                ref_id: r1.ref_id, title: r1.title, level: r1.level
+            }) AS direct_related,
+            collect(DISTINCT {
+                ref_id: r2.ref_id, title: r2.title, level: r2.level,
+                via: r1.ref_id
+            }) AS second_hop
+            RETURN c.ref_id AS source, c.title AS source_title,
+                   direct_related, second_hop
+        """
+        results, elapsed = self._timed_query(cypher, {"cid": criterion_id})
+        data = results[0] if results else {}
+
+        # Clean out null entries
+        if data:
+            data["direct_related"] = [r for r in data.get("direct_related", [])
+                                       if r.get("ref_id")]
+            data["second_hop"] = [r for r in data.get("second_hop", [])
+                                   if r.get("ref_id")]
+
+        return ToolResult(
+            tool_name=self.name, success=True,
+            data=data, execution_time=elapsed,
+        )
+
+    def _shared_techniques(self, criterion_ids: list[str]) -> ToolResult:
+        """Find techniques shared across multiple criteria."""
+        if len(criterion_ids) < 2:
+            return ToolResult(
+                tool_name=self.name, success=False,
+                error="Need at least 2 criterion_ids for shared_techniques"
+            )
+
+        cypher = """
+            MATCH (c:WCAGCriterion)-[:HAS_TECHNIQUE|HAS_ADVISORY_TECHNIQUE|HAS_FAILURE]->(t:WCAGTechnique)
+            WHERE c.ref_id IN $cids
+            WITH t, collect(DISTINCT c.ref_id) AS criteria_using
+            WHERE size(criteria_using) > 1
+            RETURN t.tech_id AS tech_id, t.title AS title,
+                   t.technology AS technology, t.category AS category,
+                   criteria_using,
+                   size(criteria_using) AS shared_count
+            ORDER BY shared_count DESC, t.tech_id
+        """
+        results, elapsed = self._timed_query(cypher, {"cids": criterion_ids})
+        return ToolResult(
+            tool_name=self.name, success=True,
+            data={
+                "criterion_ids": criterion_ids,
+                "shared_techniques_count": len(results),
+                "techniques": results,
+            },
+            execution_time=elapsed,
+        )
+
+    def _disability_overlap(self, disability_a: str, disability_b: str) -> ToolResult:
+        """Find criteria that overlap between two disability categories."""
+        cypher = """
+            MATCH (c:WCAGCriterion)
+            WHERE any(d IN c.disability_impact WHERE toLower(d) CONTAINS toLower($da))
+              AND any(d IN c.disability_impact WHERE toLower(d) CONTAINS toLower($db))
+            MATCH (c)-[:PART_OF]->(g:WCAGGuideline)-[:PART_OF]->(p:WCAGPrinciple)
+            RETURN c.ref_id AS ref_id, c.title AS title,
+                   c.level AS level, c.disability_impact AS all_impacts,
+                   c.in_brief_what_to_do AS what_to_do,
+                   g.title AS guideline, p.title AS principle
+            ORDER BY c.ref_id
+        """
+        results, elapsed = self._timed_query(cypher, {
+            "da": disability_a.lower(), "db": disability_b.lower()
+        })
+
+        # Also get criteria unique to each
+        only_a = self.db.query("""
+            MATCH (c:WCAGCriterion)
+            WHERE any(d IN c.disability_impact WHERE toLower(d) CONTAINS toLower($da))
+              AND NOT any(d IN c.disability_impact WHERE toLower(d) CONTAINS toLower($db))
+            RETURN c.ref_id AS ref_id, c.title AS title, c.level AS level
+            ORDER BY c.ref_id
+        """, {"da": disability_a.lower(), "db": disability_b.lower()})
+
+        only_b = self.db.query("""
+            MATCH (c:WCAGCriterion)
+            WHERE any(d IN c.disability_impact WHERE toLower(d) CONTAINS toLower($db))
+              AND NOT any(d IN c.disability_impact WHERE toLower(d) CONTAINS toLower($da))
+            RETURN c.ref_id AS ref_id, c.title AS title, c.level AS level
+            ORDER BY c.ref_id
+        """, {"da": disability_a.lower(), "db": disability_b.lower()})
+
+        return ToolResult(
+            tool_name=self.name, success=True,
+            data={
+                "disability_a": disability_a,
+                "disability_b": disability_b,
+                "overlapping_criteria": len(results),
+                "only_a_count": len(only_a),
+                "only_b_count": len(only_b),
+                "overlap": results,
+                "only_a": only_a,
+                "only_b": only_b,
+            },
+            execution_time=elapsed,
+        )
+
+    def _technique_coverage(self, technique_id: str) -> ToolResult:
+        """Find all criteria that a specific technique satisfies."""
+        cypher = """
+            MATCH (t:WCAGTechnique {tech_id: $tid})
+            OPTIONAL MATCH (c:WCAGCriterion)-[r:HAS_TECHNIQUE|HAS_ADVISORY_TECHNIQUE|HAS_FAILURE]->(t)
+            RETURN t.tech_id AS tech_id, t.title AS title,
+                   t.url AS url, t.technology AS technology,
+                   collect(DISTINCT {
+                       ref_id: c.ref_id,
+                       criterion_title: c.title,
+                       level: c.level,
+                       relationship: type(r)
+                   }) AS criteria
+        """
+        results, elapsed = self._timed_query(cypher, {"tid": technique_id})
+        data = results[0] if results else {}
+
+        # Clean nulls from criteria
+        if data and "criteria" in data:
+            data["criteria"] = [c for c in data["criteria"] if c.get("ref_id")]
+            data["criteria_count"] = len(data["criteria"])
+
+        return ToolResult(
+            tool_name=self.name, success=True,
+            data=data, execution_time=elapsed,
+        )
+
+    def _fix_ripple_effect(self, criterion_id: str) -> ToolResult:
+        """Analyze the ripple effect: if you fix SC X, what else benefits?"""
+        cypher = """
+            MATCH (c:WCAGCriterion {ref_id: $cid})
+
+            // Direct related criteria
+            OPTIONAL MATCH (c)-[:RELATED_CRITERION]-(related:WCAGCriterion)
+
+            // Shared techniques (other criteria using the same techniques)
+            OPTIONAL MATCH (c)-[:HAS_TECHNIQUE]->(t:WCAGTechnique)<-[:HAS_TECHNIQUE]-(shared:WCAGCriterion)
+            WHERE shared.ref_id <> $cid
+
+            // Same disability impact
+            WITH c, collect(DISTINCT {ref_id: related.ref_id, title: related.title,
+                 level: related.level, connection: 'directly_related'}) AS related_criteria,
+                 collect(DISTINCT {ref_id: shared.ref_id, title: shared.title,
+                 level: shared.level, connection: 'shared_technique'}) AS technique_siblings
+
+            RETURN c.ref_id AS source, c.title AS source_title,
+                   c.level AS source_level,
+                   c.disability_impact AS disability_impact,
+                   related_criteria, technique_siblings
+        """
+        results, elapsed = self._timed_query(cypher, {"cid": criterion_id})
+        data = results[0] if results else {}
+
+        # Clean nulls
+        if data:
+            data["related_criteria"] = [r for r in data.get("related_criteria", [])
+                                         if r.get("ref_id")]
+            data["technique_siblings"] = [r for r in data.get("technique_siblings", [])
+                                           if r.get("ref_id")]
+            # Deduplicate
+            seen = set()
+            all_affected = []
+            for item in data["related_criteria"] + data["technique_siblings"]:
+                rid = item["ref_id"]
+                if rid not in seen:
+                    seen.add(rid)
+                    all_affected.append(item)
+            data["total_affected"] = len(all_affected)
+            data["all_affected"] = all_affected
+
+        return ToolResult(
+            tool_name=self.name, success=True,
+            data=data, execution_time=elapsed,
+        )
+
+
+# ============================================================
+# TOOL 8: CONTEXT ASSEMBLER
 # ============================================================
 class ContextAssemblerTool(BaseTool):
     """
@@ -1098,6 +1550,22 @@ class ContextAssemblerTool(BaseTool):
             """, {"cid": criterion_id})
             result["test_rules"] = test_rules
 
+            # Key terms
+            key_terms = self.db.query("""
+                MATCH (c:WCAGCriterion {ref_id: $cid})-[:HAS_KEY_TERM]->(kt:WCAGKeyTerm)
+                RETURN kt.term AS term, kt.definition AS definition
+                ORDER BY kt.term
+            """, {"cid": criterion_id})
+            result["key_terms"] = key_terms
+
+            # Related resources
+            related_resources = self.db.query("""
+                MATCH (c:WCAGCriterion {ref_id: $cid})-[:HAS_RELATED_RESOURCE]->(rr:WCAGRelatedResource)
+                RETURN rr.title AS title, rr.url AS url
+                ORDER BY rr.title
+            """, {"cid": criterion_id})
+            result["related_resources"] = related_resources
+
         return result
 
     def _format_for_llm(self, contexts: list[dict]) -> str:
@@ -1194,6 +1662,21 @@ Description:
                 for tr in test_rules:
                     section += f"  🧪 {tr.get('title', '')} — {tr.get('url', '')}\n"
 
+            # Key terms
+            key_terms = ctx.get("key_terms", [])
+            if key_terms:
+                section += "\nKey Terms:\n"
+                for kt in key_terms:
+                    defn = (kt.get("definition", "") or "")[:200]
+                    section += f"  📖 {kt.get('term', '')}: {defn}\n"
+
+            # Related resources
+            related_resources = ctx.get("related_resources", [])
+            if related_resources:
+                section += "\nRelated Resources:\n"
+                for rr in related_resources:
+                    section += f"  🔗 {rr.get('title', '')} — {rr.get('url', '')}\n"
+
             sections.append(section)
 
         return "\n".join(sections)
@@ -1268,6 +1751,8 @@ class WCAGAgent:
             TechniqueFinderTool,
             RuleEngineTool,
             ImpactAnalysisTool,
+            KeyTermLookupTool,
+            CrossReferenceTool,
             ContextAssemblerTool,
         ]
         for cls in tool_classes:
@@ -1546,6 +2031,62 @@ class WCAGAgent:
                 })
                 return analysis
 
+        # ── Terminology / definition queries → key_term_lookup ──
+        term_patterns = [
+            r'(?:what\s+(?:does|is|are)|define|definition\s+of|meaning\s+of|explain)\s+["\']?(.+?)["\']?\s*(?:\?|$)',
+            r'(?:what\s+is\s+(?:meant\s+by|the\s+meaning\s+of))\s+["\']?(.+?)["\']?\s*(?:\?|$)',
+        ]
+        for pat in term_patterns:
+            m = re.search(pat, query, re.IGNORECASE)
+            if m:
+                term = m.group(1).strip().rstrip("?. ")
+                # Check if it's likely a WCAG term rather than a general question
+                if len(term.split()) <= 5:
+                    analysis["intent"] = "key_term_lookup"
+                    analysis["tool_plan"].append({
+                        "tool": "key_term_lookup",
+                        "params": {"term": term},
+                        "reason": f"Look up WCAG definition of '{term}'",
+                    })
+                    return analysis
+
+        # ── Cross-reference / relationship queries → cross_reference ──
+        if any(kw in query for kw in ["related to", "connected", "depends on",
+                                       "ripple", "cascade", "if i fix",
+                                       "what else", "overlap between",
+                                       "shared technique", "in common"]):
+            analysis["intent"] = "cross_reference"
+            if criterion_ids:
+                # Ripple / related chain for specific criteria
+                analysis["tool_plan"].append({
+                    "tool": "cross_reference",
+                    "params": {"analysis_type": "fix_ripple_effect",
+                               "criterion_id": criterion_ids[0]},
+                    "reason": f"Analyze cross-references for {criterion_ids[0]}",
+                })
+            else:
+                # Disability overlap or general cross-reference
+                analysis["tool_plan"].append({
+                    "tool": "semantic_search",
+                    "params": {"query": query, "limit": 10},
+                    "reason": "Search to identify relevant criteria for cross-reference",
+                })
+            return analysis
+
+        # ── Technique coverage queries (e.g., "what does H37 cover?") ──
+        tech_pattern = r'\b([A-Z]{1,5}\d{1,4})\b'
+        technique_ids = re.findall(tech_pattern, query)
+        if technique_ids:
+            analysis["intent"] = "technique_coverage"
+            for tid in technique_ids:
+                analysis["tool_plan"].append({
+                    "tool": "cross_reference",
+                    "params": {"analysis_type": "technique_coverage",
+                               "technique_id": tid},
+                    "reason": f"Find what criteria technique {tid} covers",
+                })
+            return analysis
+
         # Disability-related queries
         disabilities = ["blind", "deaf", "cognitive", "motor", "low vision",
                          "color blind", "seizure", "dyslexia"]
@@ -1778,6 +2319,118 @@ class WCAGAgent:
                     lines.append("")
                     continue
 
+                # Key term lookup — definitions and usage
+                if item.tool_name == "key_term_lookup" and isinstance(data, dict):
+                    lines.append("  📖 Key Term Definitions:")
+                    lines.append("")
+
+                    # Single criterion mode
+                    if "key_terms" in data:
+                        cid = data.get("criterion_id", "?")
+                        lines.append(f"  Key terms for {cid}:")
+                        for kt in data["key_terms"]:
+                            defn = (kt.get("definition", "") or "")[:300]
+                            lines.append(f"    • {kt.get('term', '?')}: {defn}")
+                        lines.append("")
+                        continue
+
+                    # Search mode
+                    terms = data.get("terms", [])
+                    if terms:
+                        for t in terms:
+                            defn = (t.get("definition", "") or "")[:300]
+                            criteria = t.get("used_in_criteria", [])
+                            criteria_str = ", ".join(c.get("ref_id", "") for c in criteria[:8])
+                            if len(criteria) > 8:
+                                criteria_str += f" (+{len(criteria) - 8} more)"
+                            lines.append(f"  📌 {t.get('term', '?')}")
+                            lines.append(f"     Definition: {defn}")
+                            lines.append(f"     Used in: {criteria_str}")
+                            lines.append("")
+                    else:
+                        lines.append(f"  No matching terms found for '{data.get('search_term', '?')}'")
+                        lines.append("")
+                    continue
+
+                # Cross-reference — multi-hop analysis
+                if item.tool_name == "cross_reference" and isinstance(data, dict):
+                    lines.append("  🔀 Cross-Reference Analysis:")
+                    lines.append("")
+
+                    # Related chain
+                    if "direct_related" in data and "second_hop" in data:
+                        source = data.get("source", "?")
+                        lines.append(f"  Relationship chain from {source} ({data.get('source_title', '')}):")
+                        lines.append("")
+                        direct = data.get("direct_related", [])
+                        if direct:
+                            lines.append("  Direct relations:")
+                            for r in direct:
+                                lines.append(f"    → [{r.get('ref_id', '?')}] {r.get('title', '')} (Level {r.get('level', '?')})")
+                        second = data.get("second_hop", [])
+                        if second:
+                            lines.append("  2nd-hop relations:")
+                            for r in second:
+                                via = f" via {r.get('via', '?')}" if r.get("via") else ""
+                                lines.append(f"    →→ [{r.get('ref_id', '?')}] {r.get('title', '')}{via}")
+                        lines.append("")
+                        continue
+
+                    # Shared techniques
+                    if "shared_techniques_count" in data:
+                        cids = ", ".join(data.get("criterion_ids", []))
+                        lines.append(f"  Shared techniques across {cids}:")
+                        lines.append(f"  Found {data['shared_techniques_count']} shared technique(s)")
+                        lines.append("")
+                        for t in data.get("techniques", []):
+                            shared_with = ", ".join(t.get("criteria_using", []))
+                            lines.append(f"    🔧 [{t.get('tech_id', '?')}] {t.get('title', '')}")
+                            lines.append(f"       Shared by: {shared_with}")
+                        lines.append("")
+                        continue
+
+                    # Disability overlap
+                    if "overlapping_criteria" in data:
+                        da = data.get("disability_a", "?")
+                        db = data.get("disability_b", "?")
+                        lines.append(f"  Disability overlap: {da} ∩ {db}")
+                        lines.append(f"  Overlapping: {data['overlapping_criteria']} | Only {da}: {data.get('only_a_count', 0)} | Only {db}: {data.get('only_b_count', 0)}")
+                        lines.append("")
+                        for c in data.get("overlap", []):
+                            lines.append(f"    ∩ [{c.get('ref_id', '?')}] {c.get('title', '')} (Level {c.get('level', '?')})")
+                        lines.append("")
+                        continue
+
+                    # Technique coverage
+                    if "criteria" in data and "tech_id" in data:
+                        lines.append(f"  Technique {data.get('tech_id', '?')}: {data.get('title', '')}")
+                        lines.append(f"  Covers {data.get('criteria_count', 0)} criteria:")
+                        for c in data.get("criteria", []):
+                            rel = c.get("relationship", "").replace("HAS_", "").lower()
+                            lines.append(f"    • [{c.get('ref_id', '?')}] {c.get('criterion_title', '')} ({rel})")
+                        lines.append("")
+                        continue
+
+                    # Ripple effect
+                    if "total_affected" in data:
+                        source = data.get("source", "?")
+                        lines.append(f"  Fix ripple effect from {source} ({data.get('source_title', '')}):")
+                        lines.append(f"  Total affected criteria: {data['total_affected']}")
+                        lines.append("")
+                        for a in data.get("all_affected", []):
+                            conn = a.get("connection", "")
+                            lines.append(f"    {'→' if conn == 'directly_related' else '🔧'} [{a.get('ref_id', '?')}] {a.get('title', '')} ({conn})")
+                        lines.append("")
+                        continue
+
+                    # Generic cross_reference fallback
+                    text = json.dumps(data, indent=2, default=str)
+                    if len(text) > 1000:
+                        text = text[:1000] + "\n  ... (truncated)"
+                    lines.append(text)
+                    lines.append("")
+                    continue
+
                 # Fallback for any other tool — compact JSON
                 lines.append(f"  [{item.tool_name}]:")
                 text = json.dumps(data, indent=2, default=str)
@@ -1894,21 +2547,64 @@ class WCAGAgent:
         """Build the system prompt for the LLM agent."""
         return """You are an expert WCAG 2.2 accessibility consultant powered by a Neo4j knowledge graph.
 
-You have access to a comprehensive WCAG 2.2 knowledge graph containing:
-- 4 Principles (Perceivable, Operable, Understandable, Robust)
-- 13 Guidelines
-- 86+ Success Criteria with full metadata
-- Sufficient, Advisory, and Failure Techniques
-- Test Rules for automated testing
-- Examples, Benefits, and Disability Impact data
+KNOWLEDGE GRAPH CONTENTS (2,418 nodes):
+- 4 Principles → 13 Guidelines → 87 Success Criteria (full metadata, intent, in-brief)
+- 412 Techniques (sufficient, advisory, failure) with technology tags
+- 725 Key Terms with formal definitions (e.g., "programmatically determined", "text alternative")
+- 284 Examples with descriptions
+- 261 Related Resources (external links)
+- 204 Benefits describing who is helped
+- 109 Automated Test Rules (ACT)
+- 91 Special Cases / exceptions
 - Cross-references between related criteria
+- Disability impact tags on every criterion
+
+AVAILABLE TOOLS (8):
+1. graph_traversal — Navigate the WCAG hierarchy by ID (principle → guideline → criterion). Use for ID-based lookups.
+2. semantic_search — Keyword search across criteria, examples, benefits, and key terms. Use for topic-based queries.
+3. technique_finder — Find sufficient/advisory/failure techniques for a criterion or technology. Use for "how to comply" questions.
+4. rule_engine — Compliance rules: element-specific rules, disability impact, conformance checklists, automatable criteria, version diffs.
+5. impact_analysis — Disability matrix, input modality analysis, criterion-level impact breakdown.
+6. key_term_lookup — Look up WCAG key term definitions. Use when user asks "what does X mean?" or references WCAG-specific terminology.
+7. cross_reference — Multi-hop graph analysis: related criterion chains, shared techniques across criteria, disability overlap, technique coverage maps, fix ripple effects.
+8. context_assembler — Assemble complete LLM-ready context for one or more criteria. Use as FINAL step before generating a response.
+
+QUERY DECOMPOSITION PATTERNS:
+
+For SCENARIO questions (e.g., "audit this login form"):
+  Step 1: Identify UI elements mentioned (form, button, input, image, video, etc.)
+  Step 2: Use rule_engine(element_rules) for each element type
+  Step 3: Use context_assembler for the union of criteria found
+  Step 4: Synthesize a checklist grouped by element
+
+For TERMINOLOGY questions (e.g., "what does programmatically determined mean?"):
+  Step 1: Use key_term_lookup(term=...) to get the formal definition
+  Step 2: Note which criteria use this term
+  Step 3: Optionally use context_assembler to provide criterion context
+
+For COMPARISON questions (e.g., "difference between 2.1 and 2.2" or "A vs AA for images"):
+  Step 1: Use cross_reference or rule_engine to get both sides
+  Step 2: Compare and present differences clearly
+
+For RIPPLE/DEPENDENCY questions (e.g., "if I fix keyboard issues, what else improves?"):
+  Step 1: Identify the criterion (e.g., 2.1.1 Keyboard)
+  Step 2: Use cross_reference(fix_ripple_effect) to map cascading benefits
+  Step 3: Use context_assembler for affected criteria details
+
+For DISABILITY-FOCUSED questions (e.g., "what helps blind users?"):
+  Step 1: Use impact_analysis(disability_matrix) or cross_reference(disability_overlap)
+  Step 2: Use context_assembler for the top criteria
+
+For TECHNIQUE questions (e.g., "what does H37 cover?" or "ARIA techniques for forms"):
+  Step 1: Use technique_finder or cross_reference(technique_coverage)
+  Step 2: Show which criteria each technique satisfies
 
 INSTRUCTIONS:
 1. ALWAYS use tools to retrieve factual WCAG information — never guess or hallucinate criteria.
-2. Start with the most specific tool for the query. Use semantic_search for topic queries, graph_traversal for ID-based queries, rule_engine for compliance questions.
+2. Start with the most specific tool for the query. Decompose complex questions into steps.
 3. After finding relevant criteria, use context_assembler to get complete information before responding.
-4. Use technique_finder when the user asks HOW to comply.
-5. Use impact_analysis when the user asks about disability categories or input modalities.
+4. Use key_term_lookup when the user references WCAG-specific terminology.
+5. Use cross_reference for any question involving relationships BETWEEN criteria or techniques.
 6. Cite specific criterion IDs (e.g., "WCAG 2.2 SC 1.4.3") in your response.
 7. When listing techniques, include the technique ID (e.g., G18, H37, F65).
 8. Structure your response clearly with sections for: applicable criteria, techniques, examples, and related criteria.
@@ -1920,7 +2616,8 @@ RESPONSE FORMAT:
 - Group information by criterion
 - Include actionable recommendations
 - Cite technique IDs and criterion numbers
-- Mention which disabilities are impacted"""
+- Mention which disabilities are impacted
+- When relevant, show which key terms apply and their definitions"""
 
     def _build_tools_schema(self) -> list[dict]:
         """Build OpenAI-compatible tool schemas from registered tools."""

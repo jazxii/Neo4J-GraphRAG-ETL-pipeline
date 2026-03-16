@@ -20,10 +20,12 @@ Graph Schema:
   Nodes : WCAGPrinciple · WCAGGuideline · WCAGCriterion
           ConformanceLevel · WCAGSpecialCase · WCAGNote · WCAGReference
           WCAGTechnique · WCAGTestRule · WCAGExample · WCAGBenefit
+          WCAGKeyTerm · WCAGRelatedResource
   Edges : PART_OF · HAS_LEVEL · HAS_SPECIAL_CASE · HAS_NOTE
           HAS_REFERENCE · RELATED_CRITERION · RELATED_GUIDELINE
           HAS_TECHNIQUE · HAS_FAILURE · HAS_ADVISORY_TECHNIQUE
           HAS_TEST_RULE · HAS_EXAMPLE · HAS_BENEFIT · IMPACTS_DISABILITY
+          HAS_KEY_TERM · HAS_RELATED_RESOURCE
 
 Usage:
   python 01_pipeline_wcag_foundation.py
@@ -97,6 +99,8 @@ class PipelineMetrics:
     test_rules: int = 0
     examples: int = 0
     benefits: int = 0
+    key_terms: int = 0
+    related_resources: int = 0
     enriched: bool = False        # True when enriched JSON is detected
     phase_times: dict = field(default_factory=dict)
 
@@ -154,14 +158,20 @@ class Neo4jConnection:
 #  PHASE 0 — PRE-FLIGHT: Clean slate + schema constraints
 # ================================================================
 def phase_preflight(db: Neo4jConnection):
-    """Prepare the database: clean auxiliary nodes, ensure constraints."""
+    """Prepare the database: full clean slate + schema constraints."""
     log.info("PHASE 0 ▸ Pre-flight checks")
 
-    # ── Clean auxiliary nodes (safe to recreate) ──
-    for label in ["WCAGSpecialCase", "WCAGNote", "WCAGReference",
-                   "WCAGTechnique", "WCAGTestRule", "WCAGExample", "WCAGBenefit"]:
+    # ── Full wipe of ALL WCAG nodes (clean reload with new enriched data) ──
+    all_wcag_labels = [
+        "WCAGSpecialCase", "WCAGNote", "WCAGReference",
+        "WCAGTechnique", "WCAGTestRule", "WCAGExample", "WCAGBenefit",
+        "WCAGKeyTerm", "WCAGRelatedResource",
+        "WCAGCriterion", "WCAGGuideline", "WCAGPrinciple",
+        "ConformanceLevel",
+    ]
+    for label in all_wcag_labels:
         db.write(f"MATCH (n:{label}) DETACH DELETE n")
-    log.info("  Cleaned auxiliary WCAG nodes")
+    log.info("  Wiped ALL WCAG nodes for clean reload")
 
     # ── Constraints & indexes ──
     schema_statements = [
@@ -180,6 +190,8 @@ def phase_preflight(db: Neo4jConnection):
         "CREATE INDEX IF NOT EXISTS FOR (t:WCAGTechnique) ON (t.technology)",
         "CREATE INDEX IF NOT EXISTS FOR (t:WCAGTechnique) ON (t.category)",
         "CREATE INDEX IF NOT EXISTS FOR (tr:WCAGTestRule) ON (tr.title)",
+        "CREATE INDEX IF NOT EXISTS FOR (kt:WCAGKeyTerm) ON (kt.term)",
+        "CREATE INDEX IF NOT EXISTS FOR (rr:WCAGRelatedResource) ON (rr.url)",
     ]
     for stmt in schema_statements:
         try:
@@ -267,6 +279,8 @@ class TransformedData:
     examples: list[dict]          # WCAGExample nodes + edges
     benefits: list[dict]          # WCAGBenefit nodes + edges
     enriched_cross_refs: list[dict]  # dynamically discovered SC ↔ SC refs
+    key_terms: list[dict]         # WCAGKeyTerm nodes + edges
+    related_resources: list[dict] # WCAGRelatedResource nodes + edges
 
 
 def phase_transform(raw_data: list[dict], metrics: PipelineMetrics) -> TransformedData:
@@ -315,6 +329,15 @@ def phase_transform(raw_data: list[dict], metrics: PipelineMetrics) -> Transform
     examples_list = []       # {criterion_id, index, title, description}
     benefits_list = []       # {criterion_id, index, description}
     enriched_cross_refs = [] # {source, target, rel, desc}
+    key_terms_list = []      # {criterion_id, index, term, definition}
+    related_resources_list = []  # {criterion_id, title, url}
+
+    # ── Build set of valid SC ref_ids for cross-ref validation ──
+    valid_ref_ids = set()
+    for p in raw_data:
+        for g in p.get("guidelines", []):
+            for sc in g.get("success_criteria", []):
+                valid_ref_ids.add(sc["ref_id"])
 
     for principle in raw_data:
         principles.append({
@@ -364,7 +387,7 @@ def phase_transform(raw_data: list[dict], metrics: PipelineMetrics) -> Transform
                 if is_enriched:
                     in_brief = sc.get("in_brief", {})
                     criterion_record.update({
-                        "intent": (sc.get("intent") or "")[:2000],
+                        "intent": sc.get("intent") or "",
                         "wcag_version": sc.get("wcag_version", "2.0"),
                         "automatable": sc.get("automatable", "manual"),
                         "disability_impact": sc.get("disability_impact", []),
@@ -468,12 +491,33 @@ def phase_transform(raw_data: list[dict], metrics: PipelineMetrics) -> Transform
 
                     # ── Enriched: Dynamic cross-references (from Understanding pages) ──
                     for related_id in sc.get("related_scs", []):
-                        enriched_cross_refs.append({
-                            "source": sc["ref_id"],
-                            "target": related_id,
-                            "rel": "RELATED_CRITERION",
-                            "desc": f"Related criterion identified from Understanding {sc['ref_id']}",
+                        # Filter out invalid ref_ids (e.g. 5.2.1, 4.8.5 don't exist)
+                        if related_id in valid_ref_ids:
+                            enriched_cross_refs.append({
+                                "source": sc["ref_id"],
+                                "target": related_id,
+                                "rel": "RELATED_CRITERION",
+                                "desc": f"Related criterion identified from Understanding {sc['ref_id']}",
+                            })
+
+                    # ── Enriched: Key Terms ──
+                    for idx, kt in enumerate(sc.get("key_terms", [])):
+                        key_terms_list.append({
+                            "criterion_id": sc["ref_id"],
+                            "index": idx,
+                            "term": kt.get("term", ""),
+                            "definition": kt.get("definition", ""),
                         })
+                        metrics.key_terms += 1
+
+                    # ── Enriched: Related Resources ──
+                    for rr in sc.get("related_resources", []):
+                        related_resources_list.append({
+                            "criterion_id": sc["ref_id"],
+                            "title": rr.get("title", ""),
+                            "url": rr.get("url", ""),
+                        })
+                        metrics.related_resources += 1
 
     # ── Static cross-references (always present) ──
     cross_refs = [
@@ -497,9 +541,10 @@ def phase_transform(raw_data: list[dict], metrics: PipelineMetrics) -> Transform
     if is_enriched:
         log.info(
             "  Enriched    → %d techniques, %d test rules, %d examples, "
-            "%d benefits, %d dynamic cross-refs",
+            "%d benefits, %d key terms, %d related resources, %d dynamic cross-refs",
             metrics.techniques, metrics.test_rules, metrics.examples,
-            metrics.benefits, len(enriched_cross_refs),
+            metrics.benefits, metrics.key_terms, metrics.related_resources,
+            len(enriched_cross_refs),
         )
 
     return TransformedData(
@@ -519,6 +564,8 @@ def phase_transform(raw_data: list[dict], metrics: PipelineMetrics) -> Transform
         examples=examples_list,
         benefits=benefits_list,
         enriched_cross_refs=enriched_cross_refs,
+        key_terms=key_terms_list,
+        related_resources=related_resources_list,
     )
 
 
@@ -760,6 +807,35 @@ def phase_load(db: Neo4jConnection, data: TransformedData):
                 log.warning("  Dynamic cross-ref %s → %s failed: %s", row["source"], row["target"], e)
         log.info("  Created %d dynamic cross-reference relationships", len(data.enriched_cross_refs))
 
+    # ── 3q. Key Term nodes + edges ──
+    if data.key_terms:
+        db.batch_write("""
+            UNWIND $rows AS row
+            MATCH (c:WCAGCriterion {ref_id: row.criterion_id})
+            CREATE (kt:WCAGKeyTerm {
+                criterion_id: row.criterion_id,
+                index:        row.index,
+                term:         row.term,
+                definition:   row.definition
+            })
+            CREATE (c)-[:HAS_KEY_TERM]->(kt)
+        """, data.key_terms)
+        log.info("  Loaded %d key terms", len(data.key_terms))
+
+    # ── 3r. Related Resource nodes + edges ──
+    if data.related_resources:
+        db.batch_write("""
+            UNWIND $rows AS row
+            MATCH (c:WCAGCriterion {ref_id: row.criterion_id})
+            CREATE (rr:WCAGRelatedResource {
+                criterion_id: row.criterion_id,
+                title:        row.title,
+                url:          row.url
+            })
+            CREATE (c)-[:HAS_RELATED_RESOURCE]->(rr)
+        """, data.related_resources)
+        log.info("  Loaded %d related resources", len(data.related_resources))
+
 
 # ================================================================
 #  PHASE 4 — VALIDATE: Post-load integrity checks
@@ -775,7 +851,8 @@ def phase_validate(db: Neo4jConnection, metrics: PipelineMetrics) -> bool:
         WHERE n:WCAGPrinciple OR n:WCAGGuideline OR n:WCAGCriterion
            OR n:WCAGSpecialCase OR n:WCAGNote OR n:WCAGReference
            OR n:ConformanceLevel OR n:WCAGTechnique OR n:WCAGTestRule
-           OR n:WCAGExample OR n:WCAGBenefit
+           OR n:WCAGExample OR n:WCAGBenefit OR n:WCAGKeyTerm
+           OR n:WCAGRelatedResource
         RETURN labels(n)[0] AS label, count(n) AS count
         ORDER BY count DESC
     """)
@@ -880,8 +957,9 @@ def phase_validate(db: Neo4jConnection, metrics: PipelineMetrics) -> bool:
             for row in automatable_stats:
                 log.info("      %-10s %d criteria", row["level"], row["count"])
 
-        # Test rules, examples, benefits counts
-        for label in ["WCAGTestRule", "WCAGExample", "WCAGBenefit"]:
+        # Test rules, examples, benefits, key terms, related resources counts
+        for label in ["WCAGTestRule", "WCAGExample", "WCAGBenefit",
+                       "WCAGKeyTerm", "WCAGRelatedResource"]:
             count = db.read(f"MATCH (n:{label}) RETURN count(n) AS count")[0]["count"]
             log.info("    %d %s nodes", count, label)
 
